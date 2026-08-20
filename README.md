@@ -161,6 +161,56 @@ This project demonstrates how to leverage an LLM-backed translation pipeline, dr
 
 The resulting files are written under the configured `DIR` (e.g. `translated-zh-tw/`), mirroring the structure of the original English workflow.
 
+### Optional: On-Demand PDF Web Service (`webapp/`)
+
+In addition to the CLI workflow, the repository ships an optional **web service** that turns submitted Markdown into a PDF over HTTP — paste Markdown in a browser, click a button, get a typeset PDF back. It is a thin wrapper around the exact same pipeline as `./devops.sh pdf`.
+
+Unlike `devops.sh` (which orchestrates Docker from your host), the web service runs *inside* the container and calls `pandoc`/`xelatex`/`tools/*.sh` directly. This makes it deployable to container hosts such as [Render](https://render.com) that run one long-lived service per container.
+
+**Components:**
+
+- **`webapp/app.py`** — a small [FastAPI](https://fastapi.tiangolo.com/) application.
+- **`Dockerfile.web`** — a self-contained image: the full MarkPaper toolchain plus the Python web server.
+- **`render.yaml`** — a Render Blueprint for one-click deployment.
+
+**Endpoints:**
+
+| Method & Path      | Description                                                        |
+| ------------------ | ------------------------------------------------------------------ |
+| `GET /`            | Browser UI: a Markdown editor with a live PDF preview pane         |
+| `POST /api/pdf`    | Submit Markdown (form field `markdown`, a file, JSON, or raw body); returns `application/pdf` |
+| `GET /api/example` | Returns the bundled `paper.md` so you can try the full example     |
+| `GET /healthz`     | Health check (used by Render)                                      |
+
+**Run locally with Docker:**
+
+```bash
+docker build -f Dockerfile.web -t markpaper-web .
+docker run --rm -p 8000:8000 markpaper-web
+# open http://localhost:8000
+```
+
+**Deploy to Render:**
+
+1. Push this repository to GitHub/GitLab.
+2. In the Render dashboard: **New +** → **Blueprint**, and select the repo. Render reads `render.yaml`.
+3. Render builds `Dockerfile.web` and starts the service, injecting `$PORT` automatically.
+
+**Configuration (environment variables):**
+
+| Variable          | Default   | Purpose                                                        |
+| ----------------- | --------- | -------------------------------------------------------------- |
+| `PORT`            | `8000`    | Port the server binds to (Render sets this automatically)      |
+| `API_TOKEN`       | *(unset)* | If set, `POST /api/pdf` requires `Authorization: Bearer <token>` |
+| `BUILD_TIMEOUT`   | `240`     | Max seconds for a single build                                 |
+| `MAX_INPUT_BYTES` | `2097152` | Max accepted Markdown payload (2 MiB)                          |
+| `MAX_CONCURRENCY` | `1`       | Simultaneous builds (keep low on small instances)              |
+| `ENABLE_MERMAID`  | `true`    | Set `false` to disable Mermaid rendering (saves memory/time)   |
+
+> **Security note**: This service compiles arbitrary user-supplied Markdown/LaTeX. XeLaTeX is run without shell-escape and with restricted file access (`openin_any=p`/`openout_any=p`), each build runs in an isolated temporary directory, and size/time/concurrency limits apply. Even so, treat a public instance as untrusted compute: **set `API_TOKEN`** for anything beyond a throwaway demo. The service is stateless and has no built-in authentication otherwise.
+
+> **Resource note**: Full TeX Live plus headless Chromium (for Mermaid) is memory-hungry. Render's 512 MB tier can run out of memory on larger documents; the **2 GB "standard" plan is recommended** (this is the default in `render.yaml`).
+
 ### Conceptual Overview of the Workflow
 
 - **Input layer**: `paper.md` (manuscript) + BibTeX bibliography file (`references.bib`) + CSL style + `cover_page.tex`.

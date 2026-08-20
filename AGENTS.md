@@ -14,6 +14,7 @@ This project is a worked example of a Markdown → Pandoc → LaTeX academic wri
 - **`paper.md`**: Primary English manuscript; contains YAML metadata that configures Pandoc, citations, cross-references, and typesetting options.
 - **`devops.sh`** / **`devops.ps1`**: The single build entry point (replaces the old `Makefile` + `make-docker.*` wrapper pair). `devops.sh` runs on Linux/macOS/WSL and does all the Docker orchestration and build logic; `devops.ps1` is a thin Windows wrapper that delegates to `bash ./devops.sh`. Operations: `pdf`, `pdf_date`, `cover`, `printed`, `translate [step]`, `tags`, `ref-list`, `toc-list`, `clean`, `deps`, `env`.
 - **`zh-tw.ini`**: Single INI config file at the repo root for the translation pipeline (`DIR`, `FROM`, `TO`, `MODEL`, optional `FIGURE_LABEL`/`TABLE_LABEL`). See the comments in that file for the full key list.
+- **`webapp/` + `Dockerfile.web` + `render.yaml`**: Optional on-demand PDF web service. `webapp/app.py` (FastAPI) reproduces the `devops.sh pdf` pipeline directly inside the container (no Docker-in-Docker) and serves it over HTTP; `Dockerfile.web` is a self-contained deployable image; `render.yaml` is a Render Blueprint. See the "Optional: On-Demand PDF Web Service" section in `README.md`.
 - **`tools/` scripts**: Linux-based helpers for font detection, translation, validation, post-processing, logo download, PDF merging, and dependency installation. All scripts run inside the Docker container.
   - **`validate-and-fix-translated-md.sh`**: AI-powered validation that reviews translated Markdown files for formatting errors (malformed tables, broken syntax, corrupted YAML) and automatically fixes them.
   - **`postprocess-translated-md.sh`**: Fixes CJK font references and (optionally) pandoc-crossref figure/table labels.
@@ -35,6 +36,15 @@ This project is a worked example of a Markdown → Pandoc → LaTeX academic wri
   - All scripts run inside the Docker container; ensure they use Linux-compatible commands (bash, standard Unix utilities).
   - The translation pipeline includes automatic validation: after initial translation, the system uses AI to detect and fix formatting errors in the translated content while preserving the translation itself.
  - **Sync plan progress to Markdown plan files**: When using plan-style workflows or multi-step tasks, always include a final step to sync the plan’s current state into the relevant Markdown plan file (e.g., under a `plans/` directory), so that progress is persistently recorded outside the transient agent context.
+
+### Web PDF Service (`webapp/`, `Dockerfile.web`, `render.yaml`)
+
+- **Role**: An optional HTTP service that turns submitted Markdown into a PDF on demand. It is a thin wrapper around the same pipeline as `./devops.sh pdf`; it does **not** replace `devops.sh` for local/CLI builds.
+- **No Docker-in-Docker**: Unlike `devops.sh` (which orchestrates `docker` from the host), the web service runs *inside* the container and invokes `tools/*.sh`, `pandoc`, and `xelatex` directly. Keep this distinction intact — do not make `webapp/` shell out to `docker`.
+- **Keep the pipeline in sync**: `webapp/app.py`'s `build_pdf()` mirrors `build_pdf()` in `devops.sh` (Mermaid → font detection → font replace → Pandoc+crossref+citeproc → `fix-latex-csl.sh` → XeLaTeX ×2). If you change the build steps in `devops.sh`, mirror them here (and vice versa).
+- **Keep the two Dockerfiles in sync**: `Dockerfile.web` duplicates the toolchain layers of `Dockerfile` and adds a Python web layer. When you change the toolchain in `Dockerfile`, update `Dockerfile.web` too.
+- **Security**: The service compiles arbitrary user-supplied Markdown/LaTeX. Preserve the hardening in `app.py` (XeLaTeX run without shell-escape and with `openin_any=p`/`openout_any=p`, per-request temp dirs, size/time/concurrency limits) and the optional `API_TOKEN` bearer gate. Never enable `-shell-escape`.
+- **Config via env vars** (not code): `PORT`, `API_TOKEN`, `BUILD_TIMEOUT`, `MAX_INPUT_BYTES`, `MAX_CONCURRENCY`, `ENABLE_MERMAID`, `MARKPAPER_ROOT`. Document changes to these in `README.md` and here.
 
 ### Commit Message Conventions for Agents
 

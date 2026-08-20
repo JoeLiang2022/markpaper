@@ -1,0 +1,36 @@
+# Render Blueprint for the MarkPaper on-demand PDF service.
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Deploy: push this repo to GitHub/GitLab, then in the Render dashboard choose
+# "New +" -> "Blueprint" and point it at the repo. Render reads this file.
+services:
+  - type: web
+    name: markpaper-pdf
+    runtime: docker
+    dockerfilePath: ./Dockerfile.web
+    # $PORT is injected by Render; the CMD in Dockerfile.web binds to it.
+    healthCheckPath: /healthz
+
+    # LaTeX (full TeX Live) + headless Chromium (Mermaid) are memory hungry.
+    # The free/starter 512 MB tier can OOM on larger documents; "standard"
+    # (2 GB) is recommended. Adjust to your needs and budget.
+    plan: standard
+
+    envVars:
+      # Cap a single build so a pathological document cannot pin the instance.
+      - key: BUILD_TIMEOUT
+        value: "240"
+      # Max Markdown payload accepted by POST /api/pdf (bytes).
+      - key: MAX_INPUT_BYTES
+        value: "2097152"
+      # Simultaneous builds. Keep at 1 on small instances to avoid OOM.
+      - key: MAX_CONCURRENCY
+        value: "1"
+      # Set to "false" to disable Mermaid rendering and save memory/time.
+      - key: ENABLE_MERMAID
+        value: "true"
+      # SECURITY: this endpoint compiles arbitrary user Markdown/LaTeX.
+      # Generate a token and require it on POST /api/pdf. Leave unset only for
+      # a fully public/demo instance.
+      - key: API_TOKEN
+        generateValue: true

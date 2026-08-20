@@ -58,6 +58,12 @@ dist-newstyle/
 # API keys
 .api_key
 
+# Python (web service)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
 # Post Process intermediate files
 paper.mermaid.tmp.md
 paper.tmp.md
