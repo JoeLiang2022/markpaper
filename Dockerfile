@@ -1,7 +1,8 @@
 FROM dalibo/pandocker:latest-full
 
-# Ensure Node.js runs reliably across all architectures (including QEMU emulation on ARM64 Linux)
-ENV NODE_OPTIONS="--jitless"
+# NOTE: do NOT set NODE_OPTIONS="--jitless" here. --jitless disables the JIT and
+# therefore WebAssembly, which Node's bundled undici (used by npm/puppeteer during
+# install) requires -> "ReferenceError: WebAssembly is not defined".
 
 # Install jq and curl for translation scripts
 # Install basic dependencies for Puppeteer/Chrome (required by mermaid-cli)
