@@ -12,9 +12,11 @@ services:
     healthCheckPath: /healthz
 
     # LaTeX (full TeX Live) + headless Chromium (Mermaid) are memory hungry.
-    # The free/starter 512 MB tier can OOM on larger documents; "standard"
-    # (2 GB) is recommended. Adjust to your needs and budget.
-    plan: standard
+    # "free" (512 MB, $0) is fine for plain Markdown; Chromium only starts when a
+    # document actually contains Mermaid diagrams, which can OOM on 512 MB. If you
+    # hit out-of-memory errors, either set ENABLE_MERMAID=false or upgrade the plan
+    # (e.g. "starter" or "standard"). Free instances also sleep after ~15 min idle.
+    plan: free
 
     envVars:
       # Cap a single build so a pathological document cannot pin the instance.

@@ -209,7 +209,7 @@ docker run --rm -p 8000:8000 markpaper-web
 
 > **Security note**: This service compiles arbitrary user-supplied Markdown/LaTeX. XeLaTeX is run without shell-escape and with restricted file access (`openin_any=p`/`openout_any=p`), each build runs in an isolated temporary directory, and size/time/concurrency limits apply. Even so, treat a public instance as untrusted compute: **set `API_TOKEN`** for anything beyond a throwaway demo. The service is stateless and has no built-in authentication otherwise.
 
-> **Resource note**: Full TeX Live plus headless Chromium (for Mermaid) is memory-hungry. Render's 512 MB tier can run out of memory on larger documents; the **2 GB "standard" plan is recommended** (this is the default in `render.yaml`).
+> **Resource note**: `render.yaml` defaults to the **free** plan (512 MB, $0), which is fine for plain Markdown. Headless Chromium only starts when a document actually contains Mermaid diagrams, and that can exhaust 512 MB — if you hit out-of-memory errors on a Mermaid-heavy document, either set `ENABLE_MERMAID=false` or upgrade the plan (`starter`/`standard`). Free instances also sleep after ~15 minutes of inactivity and cold-start slowly because the image is large.
 
 ### Conceptual Overview of the Workflow
 
