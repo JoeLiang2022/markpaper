@@ -30,7 +30,8 @@ services:
       - key: ENABLE_MERMAID
         value: "true"
       # SECURITY: this endpoint compiles arbitrary user Markdown/LaTeX.
-      # Generate a token and require it on POST /api/pdf. Leave unset only for
-      # a fully public/demo instance.
-      - key: API_TOKEN
-        generateValue: true
+      # By default the service is PUBLIC so the browser UI works out of the box.
+      # To lock it down, add an environment variable named API_TOKEN in the
+      # Render dashboard (Environment tab) with a strong secret value. Once set,
+      # POST /api/pdf requires "Authorization: Bearer <token>"; the browser UI
+      # has an "API token" field to supply it.

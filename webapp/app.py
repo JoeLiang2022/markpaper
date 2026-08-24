@@ -315,6 +315,9 @@ _INDEX_HTML = """\
            align-items: center; gap: 12px; flex-wrap: wrap; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .spacer { flex: 1; }
+  header input { font: inherit; padding: 6px 10px; border-radius: 6px;
+                 border: 1px solid #8886; background: transparent; color: inherit;
+                 width: 160px; }
   button { font: inherit; padding: 7px 14px; border-radius: 6px; border: 1px solid #8886;
            background: #2563eb; color: #fff; cursor: pointer; }
   button.secondary { background: transparent; color: inherit; }
@@ -339,6 +342,8 @@ _INDEX_HTML = """\
 <header>
   <h1>MarkPaper &middot; Markdown &rarr; PDF</h1>
   <div class="spacer"></div>
+  <input id="token" type="password" placeholder="API token (if required)"
+         title="Only needed if the server has API_TOKEN set" />
   <button class="secondary" id="loadExample" type="button">Load example paper</button>
   <button class="secondary" id="download" type="button" disabled>Download PDF</button>
   <button id="generate" type="button">Generate PDF</button>
@@ -395,7 +400,10 @@ _INDEX_HTML = """\
     try {
       const form = new FormData();
       form.append("markdown", src.value);
-      const r = await fetch("/api/pdf", { method: "POST", body: form });
+      const headers = {};
+      const tok = $("token").value.trim();
+      if (tok) headers["Authorization"] = "Bearer " + tok;
+      const r = await fetch("/api/pdf", { method: "POST", body: form, headers });
       if (!r.ok) {
         let msg = "HTTP " + r.status;
         try {
