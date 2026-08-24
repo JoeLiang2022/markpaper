@@ -12,18 +12,27 @@ ENV NODE_OPTIONS="--jitless"
 
 # --- Toolchain (mirrors ./Dockerfile) -------------------------------------- #
 
-# Install jq and curl for translation scripts, Node.js/npm for mermaid-cli,
-# and the basic dependencies Puppeteer/Chrome needs (required by mermaid-cli).
+# Install jq and curl for translation scripts, plus the basic dependencies
+# Puppeteer/Chrome needs (required by mermaid-cli).
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
-        jq curl nodejs npm \
-        ca-certificates fonts-liberation fonts-noto-color-emoji \
+        jq curl gnupg ca-certificates \
+        fonts-liberation fonts-noto-color-emoji \
         libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
         libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
         libgbm1 libpangocairo-1.0-0 libcairo-gobject2 \
         libgtk-3-0 libgdk-pixbuf2.0-0 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 22 LTS. The base image ships Node 18, which is too old for the
+# current mermaid-cli / puppeteer packages (they use the RegExp `v` flag that
+# only Node 20+ understands, so `puppeteer browsers install` crashes on Node 18).
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y -qq nodejs && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    node --version
 
 # Install mermaid-cli globally
 RUN npm install -g @mermaid-js/mermaid-cli
