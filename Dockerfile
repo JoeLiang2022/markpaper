@@ -63,20 +63,33 @@ RUN apt-get update -qq && \
 # frozen historic repository matching the installed release, and do NOT run
 # "tlmgr update --self" (cross-release self-update is what fails).
 RUN set -eu; \
-    TLYEAR="$(tlmgr --version 2>/dev/null | sed -n 's/.*version \([0-9]\{4\}\).*/\1/p' | tail -1)"; \
-    [ -n "$TLYEAR" ] || TLYEAR=2025; \
-    echo "Detected TeX Live ${TLYEAR}"; \
-    for base in \
-        "https://ftp.math.utah.edu/pub/tex/historic" \
-        "https://ftp.tu-chemnitz.de/pub/tug/historic" \
-        "https://mirror.ctan.org/systems/texlive/tlnet" ; do \
-        case "$base" in \
-            *historic) repo="${base}/systems/texlive/${TLYEAR}/tlnet-final" ;; \
-            *)         repo="$base" ;; \
-        esac; \
-        echo "Trying TeX Live repository: ${repo}"; \
-        if tlmgr option repository "$repo" && tlmgr install placeins; then break; fi; \
-    done; \
+    if kpsewhich placeins.sty >/dev/null 2>&1; then \
+        echo "placeins.sty already present"; \
+    else \
+        TLYEAR="$(tlmgr --version 2>/dev/null | sed -n 's/.*version \([0-9]\{4\}\).*/\1/p' | tail -1)"; \
+        [ -n "$TLYEAR" ] || TLYEAR=2025; \
+        echo "Detected TeX Live ${TLYEAR}"; \
+        # Historic archives are signed with a now-expired key, so skip repo
+        # verification (--verify-repo=none) or tlmgr refuses to proceed.
+        for base in \
+            "https://ftp.math.utah.edu/pub/tex/historic" \
+            "https://ftp.tu-chemnitz.de/pub/tug/historic" ; do \
+            repo="${base}/systems/texlive/${TLYEAR}/tlnet-final"; \
+            echo "Trying TeX Live repository: ${repo}"; \
+            tlmgr --repository "$repo" --verify-repo=none install placeins || true; \
+            if kpsewhich placeins.sty >/dev/null 2>&1; then break; fi; \
+        done; \
+        # Last resort: placeins is a single public-domain .sty file, so fetch it
+        # straight from CTAN into TEXMFLOCAL. Avoids all tlmgr mirror/key issues.
+        if ! kpsewhich placeins.sty >/dev/null 2>&1; then \
+            echo "Falling back to direct CTAN download"; \
+            TEXMFLOCAL="$(kpsewhich -var-value=TEXMFLOCAL)"; \
+            mkdir -p "${TEXMFLOCAL}/tex/latex/placeins"; \
+            curl -fsSL -o "${TEXMFLOCAL}/tex/latex/placeins/placeins.sty" \
+                https://mirrors.ctan.org/macros/latex/contrib/placeins/placeins.sty; \
+            mktexlsr; \
+        fi; \
+    fi; \
     kpsewhich placeins.sty || { echo "ERROR: placeins.sty not installed"; exit 1; }
 
 # Keep the same entrypoint as base image
