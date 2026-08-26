@@ -175,12 +175,40 @@ Unlike `devops.sh` (which orchestrates Docker from your host), the web service r
 
 **Endpoints:**
 
-| Method & Path      | Description                                                        |
-| ------------------ | ------------------------------------------------------------------ |
-| `GET /`            | Browser UI: a Markdown editor with a live PDF preview pane         |
-| `POST /api/pdf`    | Submit Markdown (form field `markdown`, a file, JSON, or raw body); returns `application/pdf` |
-| `GET /api/example` | Returns the bundled `paper.md` so you can try the full example     |
-| `GET /healthz`     | Health check (used by Render)                                      |
+| Method & Path             | Description                                                        |
+| ------------------------- | ------------------------------------------------------------------ |
+| `GET /`                   | Browser UI: a Markdown editor with a live PDF preview pane         |
+| `POST /api/jobs`          | Queue a build; returns `202` with a `job_id` immediately           |
+| `GET /api/jobs/{id}`      | Job status, including `queue_position` and timings                 |
+| `GET /api/jobs/{id}/pdf`  | Download the finished PDF (`409` if not ready)                     |
+| `DELETE /api/jobs/{id}`   | Cancel a queued job, or discard a finished one                     |
+| `POST /api/pdf`           | Submit **and wait**; returns `application/pdf` in one call         |
+| `GET /api/example`        | Returns the bundled `paper.md` so you can try the full example     |
+| `GET /healthz`            | Health check (used by Render); also reports queue depth            |
+
+**Multi-user behaviour.** Builds are slow and memory-hungry, so at most `MAX_CONCURRENCY` run at a time (default `1`) and the rest queue. Any number of people can use the service concurrently:
+
+- **Queueing**: submissions are served first-come, first-served. The browser UI polls once a second and shows your **position in the queue** ("position 3, 2 ahead of you"), then switches to a build timer. Queued jobs can be cancelled; a build already running cannot.
+- **Isolation**: every job builds in its own temporary directory (unique name, its own `TEXMFVAR`) which is deleted afterwards, whether it succeeded or failed. There is no database and nothing is persisted; the PDF is held in memory only until you download it or it expires (`JOB_TTL`).
+- **Prefer `/api/jobs` for anything interactive.** `POST /api/pdf` holds the connection open for the entire queue wait plus build, so browsers or proxies may time out first. It exists for curl and scripts.
+
+State lives in memory in a single process, which suits one free-tier instance. Jobs do not survive a restart and are not shared across multiple instances.
+
+**Using it from the command line:**
+
+```bash
+BASE=https://your-service.onrender.com
+
+# One-shot: submit and wait (simplest; may time out on a long queue)
+curl -X POST "$BASE/api/pdf" -F "markdown=$(cat paper.md)" -o paper.pdf
+
+# Job mode: submit, poll, download (no long-held connection)
+ID=$(curl -sX POST "$BASE/api/jobs" -F "markdown=$(cat paper.md)" | jq -r .job_id)
+until [ "$(curl -s "$BASE/api/jobs/$ID" | jq -r .status)" = "done" ]; do sleep 2; done
+curl -s "$BASE/api/jobs/$ID/pdf" -o paper.pdf
+```
+
+Add `-H "Authorization: Bearer $API_TOKEN"` to each call if the service has a token set.
 
 **Run locally with Docker:**
 
@@ -198,14 +226,18 @@ docker run --rm -p 8000:8000 markpaper-web
 
 **Configuration (environment variables):**
 
-| Variable          | Default   | Purpose                                                        |
-| ----------------- | --------- | -------------------------------------------------------------- |
-| `PORT`            | `8000`    | Port the server binds to (Render sets this automatically)      |
-| `API_TOKEN`       | *(unset)* | If set, `POST /api/pdf` requires `Authorization: Bearer <token>` |
-| `BUILD_TIMEOUT`   | `240`     | Max seconds for a single build                                 |
-| `MAX_INPUT_BYTES` | `2097152` | Max accepted Markdown payload (2 MiB)                          |
-| `MAX_CONCURRENCY` | `1`       | Simultaneous builds (keep low on small instances)              |
-| `ENABLE_MERMAID`  | `true`    | Set `false` to disable Mermaid rendering (saves memory/time)   |
+| Variable             | Default   | Purpose                                                        |
+| -------------------- | --------- | -------------------------------------------------------------- |
+| `PORT`               | `8000`    | Port the server binds to (Render sets this automatically)      |
+| `API_TOKEN`          | *(unset)* | If set, the API requires `Authorization: Bearer <token>`       |
+| `BUILD_TIMEOUT`      | `240`     | Max seconds for a single build                                 |
+| `MAX_INPUT_BYTES`    | `2097152` | Max accepted Markdown payload (2 MiB)                          |
+| `MAX_CONCURRENCY`    | `1`       | Simultaneous builds / worker count (budget ~1 GB each)         |
+| `MAX_QUEUE`          | `50`      | Max jobs waiting before new submissions get `429`              |
+| `JOB_TTL`            | `900`     | Seconds a finished result is retained                          |
+| `MAX_STORED_RESULTS` | `20`      | Max finished PDFs kept in memory (oldest evicted first)        |
+| `SYNC_WAIT_TIMEOUT`  | `600`     | Max seconds `POST /api/pdf` waits before returning `504`       |
+| `ENABLE_MERMAID`     | `true`    | Set `false` to disable Mermaid rendering (saves memory/time)   |
 
 > **Security note**: This service compiles arbitrary user-supplied Markdown/LaTeX. XeLaTeX is run without shell-escape and with restricted file access (`openin_any=p`/`openout_any=p`), each build runs in an isolated temporary directory, and size/time/concurrency limits apply. Even so, treat a public instance as untrusted compute: **set `API_TOKEN`** for anything beyond a throwaway demo. The service is stateless and has no built-in authentication otherwise.
 

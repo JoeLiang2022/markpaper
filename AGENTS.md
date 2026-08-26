@@ -40,11 +40,14 @@ This project is a worked example of a Markdown → Pandoc → LaTeX academic wri
 ### Web PDF Service (`webapp/`, `Dockerfile.web`, `render.yaml`)
 
 - **Role**: An optional HTTP service that turns submitted Markdown into a PDF on demand. It is a thin wrapper around the same pipeline as `./devops.sh pdf`; it does **not** replace `devops.sh` for local/CLI builds.
+- **Async job model**: Submissions are queued (`POST /api/jobs` → poll `GET /api/jobs/{id}` → fetch `/api/jobs/{id}/pdf`). An in-memory `asyncio.Queue` with `MAX_CONCURRENCY` workers serialises builds; the UI polls and shows queue position. `POST /api/pdf` is the synchronous convenience path and goes through the *same* queue — keep both paths sharing one concurrency control rather than adding a second mechanism. State is intentionally in-memory (single instance, no Redis/DB); don't add external infrastructure without being asked.
+- **Per-job isolation is a hard requirement**: each build gets its own temp dir and `TEXMFVAR`, removed in a `finally`. Never introduce shared mutable working directories.
 - **No Docker-in-Docker**: Unlike `devops.sh` (which orchestrates `docker` from the host), the web service runs *inside* the container and invokes `tools/*.sh`, `pandoc`, and `xelatex` directly. Keep this distinction intact — do not make `webapp/` shell out to `docker`.
 - **Keep the pipeline in sync**: `webapp/app.py`'s `build_pdf()` mirrors `build_pdf()` in `devops.sh` (Mermaid → font detection → font replace → Pandoc+crossref+citeproc → `fix-latex-csl.sh` → XeLaTeX ×2). If you change the build steps in `devops.sh`, mirror them here (and vice versa).
 - **Keep the two Dockerfiles in sync**: `Dockerfile.web` duplicates the toolchain layers of `Dockerfile` and adds a Python web layer. When you change the toolchain in `Dockerfile`, update `Dockerfile.web` too.
 - **Security**: The service compiles arbitrary user-supplied Markdown/LaTeX. Preserve the hardening in `app.py` (XeLaTeX run without shell-escape and with `openin_any=p`/`openout_any=p`, per-request temp dirs, size/time/concurrency limits) and the optional `API_TOKEN` bearer gate. Never enable `-shell-escape`.
-- **Config via env vars** (not code): `PORT`, `API_TOKEN`, `BUILD_TIMEOUT`, `MAX_INPUT_BYTES`, `MAX_CONCURRENCY`, `ENABLE_MERMAID`, `MARKPAPER_ROOT`. Document changes to these in `README.md` and here.
+- **Config via env vars** (not code): `PORT`, `API_TOKEN`, `BUILD_TIMEOUT`, `MAX_INPUT_BYTES`, `MAX_CONCURRENCY`, `MAX_QUEUE`, `JOB_TTL`, `MAX_STORED_RESULTS`, `SYNC_WAIT_TIMEOUT`, `ENABLE_MERMAID`, `MARKPAPER_ROOT`. Document changes to these in `README.md` and here.
+- **Memory discipline**: finished PDFs are held in RAM, so `JOB_TTL` expiry and `MAX_STORED_RESULTS` eviction must stay in place — the free tier only has 512 MB.
 
 ### Commit Message Conventions for Agents
 

@@ -22,11 +22,15 @@ See SECURITY CONSIDERATIONS below and the README. Set API_TOKEN in production.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -54,10 +58,11 @@ MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "1"))         # simultan
 ENABLE_MERMAID = os.environ.get("ENABLE_MERMAID", "true").lower() not in ("0", "false", "no")
 API_TOKEN = os.environ.get("API_TOKEN", "").strip()                  # optional bearer token
 
-# A semaphore protects small instances (LaTeX + Chromium are memory hungry).
-_build_semaphore = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
-
-app = FastAPI(title="MarkPaper PDF Service", version="1.0.0")
+# Job queue knobs
+JOB_TTL = int(os.environ.get("JOB_TTL", "900"))            # keep finished results (s)
+MAX_QUEUE = int(os.environ.get("MAX_QUEUE", "50"))          # reject submissions beyond this
+MAX_STORED_RESULTS = int(os.environ.get("MAX_STORED_RESULTS", "20"))  # retained PDFs
+SYNC_WAIT_TIMEOUT = int(os.environ.get("SYNC_WAIT_TIMEOUT", "600"))   # /api/pdf max wait
 
 
 # --------------------------------------------------------------------------- #
@@ -202,8 +207,180 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
+# Job queue
+# --------------------------------------------------------------------------- #
+#
+# Builds are slow (LaTeX runs twice) and memory-hungry, so at most
+# MAX_CONCURRENCY run at once. Rather than making callers hold an HTTP
+# connection open for the whole wait, submissions become jobs: the client gets
+# an id immediately and polls for status, including its position in the queue.
+#
+# Everything lives in memory in a single process. That is deliberate for a
+# single free-tier instance: no Redis, no database. It also means jobs do not
+# survive a restart and would not be shared across multiple instances.
+
+@dataclass
+class Job:
+    id: str
+    markdown: str
+    bib: Optional[str] = None
+    status: str = "queued"          # queued | running | done | error | cancelled
+    submitted_at: float = field(default_factory=time.monotonic)
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    pdf: Optional[bytes] = None
+    error: Optional[str] = None
+    log: str = ""
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+_jobs: dict[str, Job] = {}
+_job_order: list[str] = []                      # submission order, for queue position
+_queue: Optional[asyncio.Queue] = None          # created in the lifespan
+_tasks: list[asyncio.Task] = []
+
+ACTIVE_STATES = ("queued", "running")
+
+
+def _queued_count() -> int:
+    return sum(1 for jid in _job_order
+               if (j := _jobs.get(jid)) is not None and j.status == "queued")
+
+
+def _running_count() -> int:
+    return sum(1 for jid in _job_order
+               if (j := _jobs.get(jid)) is not None and j.status == "running")
+
+
+def _queue_position(job_id: str) -> Optional[int]:
+    """1-based position among still-queued jobs, or None if not queued."""
+    position = 0
+    for jid in _job_order:
+        job = _jobs.get(jid)
+        if job is None or job.status != "queued":
+            continue
+        position += 1
+        if jid == job_id:
+            return position
+    return None
+
+
+def _drop(job_id: str) -> None:
+    _jobs.pop(job_id, None)
+    with contextlib.suppress(ValueError):
+        _job_order.remove(job_id)
+
+
+def _evict_old_results() -> None:
+    """Cap retained PDFs so a busy day cannot exhaust a 512 MB instance."""
+    finished = [jid for jid in _job_order
+                if (j := _jobs.get(jid)) is not None and j.pdf is not None]
+    for jid in finished[:max(0, len(finished) - MAX_STORED_RESULTS)]:
+        _drop(jid)
+
+
+async def _worker() -> None:
+    """Pull jobs off the queue and build them, one at a time per worker."""
+    assert _queue is not None
+    while True:
+        job_id = await _queue.get()
+        try:
+            job = _jobs.get(job_id)
+            if job is None or job.status == "cancelled":
+                continue
+            job.status = "running"
+            job.started_at = time.monotonic()
+            try:
+                # build_pdf is blocking; run it off the event loop so status
+                # polling and health checks stay responsive during a build.
+                job.pdf = await asyncio.to_thread(build_pdf, job.markdown, job.bib)
+                job.status = "done"
+            except BuildError as exc:
+                job.status, job.error, job.log = "error", str(exc), exc.log
+            except subprocess.TimeoutExpired:
+                job.status, job.error = "error", "Build timed out."
+            except Exception as exc:                      # noqa: BLE001
+                job.status, job.error = "error", f"Unexpected error: {exc}"
+            finally:
+                job.finished_at = time.monotonic()
+                job.markdown = ""        # release the source text
+                job.done.set()
+                _evict_old_results()
+        finally:
+            _queue.task_done()
+
+
+async def _reaper() -> None:
+    """Expire finished jobs so results (and their PDFs) do not leak memory."""
+    while True:
+        await asyncio.sleep(30)
+        now = time.monotonic()
+        for job_id in list(_job_order):
+            job = _jobs.get(job_id)
+            if job and job.finished_at and (now - job.finished_at) > JOB_TTL:
+                _drop(job_id)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global _queue
+    _queue = asyncio.Queue()
+    for _ in range(max(1, MAX_CONCURRENCY)):
+        _tasks.append(asyncio.create_task(_worker()))
+    _tasks.append(asyncio.create_task(_reaper()))
+    try:
+        yield
+    finally:
+        for task in _tasks:
+            task.cancel()
+        await asyncio.gather(*_tasks, return_exceptions=True)
+        _tasks.clear()
+
+
+def _submit(markdown: str, bib: Optional[str]) -> Job:
+    """Create a job and enqueue it. Raises HTTPException if the queue is full."""
+    if _queue is None:
+        raise HTTPException(status_code=503, detail="Service is starting up.")
+    if _queued_count() >= MAX_QUEUE:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Queue is full ({MAX_QUEUE} waiting). Try again shortly.",
+        )
+    job = Job(id=uuid.uuid4().hex, markdown=markdown, bib=bib)
+    _jobs[job.id] = job
+    _job_order.append(job.id)
+    _queue.put_nowait(job.id)
+    return job
+
+
+def _job_state(job: Job) -> dict:
+    """Serialisable status payload (never includes the PDF itself)."""
+    now = time.monotonic()
+    state: dict = {
+        "job_id": job.id,
+        "status": job.status,
+        "queue_position": _queue_position(job.id),
+        "queued_total": _queued_count(),
+        "running_total": _running_count(),
+        "waited_seconds": round((job.started_at or now) - job.submitted_at, 1),
+    }
+    if job.started_at:
+        state["build_seconds"] = round((job.finished_at or now) - job.started_at, 1)
+    if job.status == "done":
+        state["pdf_url"] = f"/api/jobs/{job.id}/pdf"
+        state["size_bytes"] = len(job.pdf or b"")
+    if job.status == "error":
+        state["error"] = job.error
+        state["log"] = job.log
+    return state
+
+
+# --------------------------------------------------------------------------- #
 # HTTP layer
 # --------------------------------------------------------------------------- #
+
+app = FastAPI(title="MarkPaper PDF Service", version="2.0.0", lifespan=lifespan)
+
 
 def _check_auth(request: Request) -> None:
     """Enforce a bearer token if API_TOKEN is configured. No-op otherwise."""
@@ -215,28 +392,13 @@ def _check_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing API token.")
 
 
-@app.get("/healthz")
-async def healthz() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
-
-
-@app.get("/api/example", response_class=PlainTextResponse)
-async def api_example() -> PlainTextResponse:
-    if EXAMPLE_PAPER.exists():
-        return PlainTextResponse(EXAMPLE_PAPER.read_text(encoding="utf-8"))
-    return PlainTextResponse(_STARTER_MARKDOWN)
-
-
-@app.post("/api/pdf")
-async def api_pdf(
+async def _extract_input(
     request: Request,
-    markdown: Optional[str] = Form(default=None),
-    bib: Optional[str] = Form(default=None),
-    file: Optional[UploadFile] = None,
-) -> Response:
-    _check_auth(request)
-
-    # Accept markdown from a form field, an uploaded file, or a raw JSON body.
+    markdown: Optional[str],
+    bib: Optional[str],
+    file: Optional[UploadFile],
+) -> tuple[str, Optional[str]]:
+    """Accept Markdown from a form field, an upload, a JSON body, or raw text."""
     content = markdown
     if content is None and file is not None:
         content = (await file.read()).decode("utf-8", errors="replace")
@@ -252,29 +414,134 @@ async def api_pdf(
 
     if not content or not content.strip():
         raise HTTPException(status_code=400, detail="No Markdown provided.")
-
     if len(content.encode("utf-8")) > MAX_INPUT_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Input exceeds {MAX_INPUT_BYTES} bytes.",
-        )
+        raise HTTPException(status_code=413,
+                            detail=f"Input exceeds {MAX_INPUT_BYTES} bytes.")
+    return content, bib
 
-    async with _build_semaphore:
-        try:
-            pdf_bytes = await asyncio.to_thread(build_pdf, content, bib)
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="Build timed out.")
-        except BuildError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail={"error": str(exc), "log": exc.log},
-            )
 
+def _pdf_response(pdf: bytes) -> Response:
     return Response(
-        content=pdf_bytes,
+        content=pdf,
         media_type="application/pdf",
         headers={"Content-Disposition": 'inline; filename="paper.pdf"'},
     )
+
+
+@app.get("/healthz")
+async def healthz() -> JSONResponse:
+    return JSONResponse({
+        "status": "ok",
+        "queued": _queued_count(),
+        "running": _running_count(),
+        "workers": max(1, MAX_CONCURRENCY),
+    })
+
+
+@app.get("/api/example", response_class=PlainTextResponse)
+async def api_example() -> PlainTextResponse:
+    if EXAMPLE_PAPER.exists():
+        return PlainTextResponse(EXAMPLE_PAPER.read_text(encoding="utf-8"))
+    return PlainTextResponse(_STARTER_MARKDOWN)
+
+
+# ---- Async job mode ------------------------------------------------------- #
+
+@app.post("/api/jobs", status_code=202)
+async def api_create_job(
+    request: Request,
+    markdown: Optional[str] = Form(default=None),
+    bib: Optional[str] = Form(default=None),
+    file: Optional[UploadFile] = None,
+) -> JSONResponse:
+    """Queue a build and return immediately with a job id to poll."""
+    _check_auth(request)
+    content, bib = await _extract_input(request, markdown, bib, file)
+    job = _submit(content, bib)
+    return JSONResponse(_job_state(job), status_code=202)
+
+
+@app.get("/api/jobs/{job_id}")
+async def api_job_status(request: Request, job_id: str) -> JSONResponse:
+    _check_auth(request)
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired job.")
+    return JSONResponse(_job_state(job))
+
+
+@app.get("/api/jobs/{job_id}/pdf")
+async def api_job_pdf(request: Request, job_id: str) -> Response:
+    _check_auth(request)
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired job.")
+    if job.status != "done" or job.pdf is None:
+        raise HTTPException(status_code=409,
+                            detail=f"Job is '{job.status}', not ready.")
+    return _pdf_response(job.pdf)
+
+
+@app.delete("/api/jobs/{job_id}")
+async def api_job_delete(request: Request, job_id: str) -> JSONResponse:
+    """Cancel a queued job, or discard a finished one."""
+    _check_auth(request)
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired job.")
+    if job.status == "queued":
+        # The worker skips cancelled jobs when it reaches them.
+        job.status = "cancelled"
+        job.finished_at = time.monotonic()
+        job.markdown = ""
+        job.done.set()
+        return JSONResponse({"job_id": job_id, "status": "cancelled"})
+    if job.status == "running":
+        # A running build cannot be interrupted safely; let it finish.
+        raise HTTPException(status_code=409,
+                            detail="Job is already building; cannot cancel.")
+    _drop(job_id)
+    return JSONResponse({"job_id": job_id, "status": "deleted"})
+
+
+# ---- Synchronous mode (kept for CLI/API convenience) ---------------------- #
+
+@app.post("/api/pdf")
+async def api_pdf(
+    request: Request,
+    markdown: Optional[str] = Form(default=None),
+    bib: Optional[str] = Form(default=None),
+    file: Optional[UploadFile] = None,
+) -> Response:
+    """
+    Submit and wait for the PDF in one call.
+
+    Convenient for curl/scripts, but the connection stays open for the whole
+    queue wait plus build. Browsers and proxies may time out first; prefer
+    /api/jobs for anything interactive.
+    """
+    _check_auth(request)
+    content, bib = await _extract_input(request, markdown, bib, file)
+    job = _submit(content, bib)
+
+    try:
+        await asyncio.wait_for(job.done.wait(), timeout=SYNC_WAIT_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail={"error": "Timed out waiting for the build.",
+                    "job_id": job.id,
+                    "hint": f"Poll /api/jobs/{job.id} instead."},
+        )
+
+    if job.status == "error":
+        raise HTTPException(status_code=422,
+                            detail={"error": job.error, "log": job.log})
+    if job.status != "done" or job.pdf is None:
+        raise HTTPException(status_code=500,
+                            detail=f"Build ended as '{job.status}'.")
+
+    return _pdf_response(job.pdf)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -346,6 +613,7 @@ _INDEX_HTML = """\
          title="Only needed if the server has API_TOKEN set" />
   <button class="secondary" id="loadExample" type="button">Load example paper</button>
   <button class="secondary" id="download" type="button" disabled>Download PDF</button>
+  <button class="secondary" id="cancel" type="button" hidden>Cancel</button>
   <button id="generate" type="button">Generate PDF</button>
 </header>
 <main>
@@ -359,7 +627,8 @@ _INDEX_HTML = """\
   const $ = (id) => document.getElementById(id);
   const src = $("src"), frame = $("frame"), status = $("status");
   const btnGen = $("generate"), btnEx = $("loadExample"), btnDl = $("download");
-  let lastUrl = null;
+  const btnCancel = $("cancel");
+  let lastUrl = null, currentJob = null, polling = false;
 
   const starter = `---\\ntitle: Hello, MarkPaper\\nauthor: Anonymous\\n---\\n\\n# Introduction\\n\\nThis PDF was generated on demand from **Markdown**.\\n`;
   src.value = starter.replace(/\\\\n/g, "\\n");
@@ -394,31 +663,93 @@ _INDEX_HTML = """\
     a.href = lastUrl; a.download = "paper.pdf"; a.click();
   });
 
+  function authHeaders() {
+    const tok = $("token").value.trim();
+    return tok ? { "Authorization": "Bearer " + tok } : {};
+  }
+
+  async function errorText(r) {
+    let msg = "HTTP " + r.status;
+    try {
+      const j = await r.json();
+      if (j.detail && j.detail.log) msg = j.detail.error + "\\n\\n" + j.detail.log;
+      else if (j.detail) msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+    } catch (_) {}
+    return msg;
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function describe(s) {
+    if (s.status === "queued") {
+      const pos = s.queue_position;
+      const ahead = pos && pos > 1 ? (pos - 1) + " ahead of you" : "next in line";
+      return "Queued &middot; position <strong>" + (pos || "?") + "</strong> (" + ahead + ")"
+           + "<br><small>" + s.queued_total + " waiting, " + s.running_total + " building"
+           + " &middot; waited " + s.waited_seconds + "s</small>";
+    }
+    if (s.status === "running") {
+      return "Building&hellip; <small>(" + (s.build_seconds || 0) + "s)</small>"
+           + "<br><small>LaTeX runs twice, so this takes a moment.</small>";
+    }
+    return "Working&hellip;";
+  }
+
+  function finish() {
+    polling = false; currentJob = null;
+    btnGen.disabled = false; btnCancel.hidden = true;
+  }
+
+  btnCancel.addEventListener("click", async () => {
+    if (!currentJob) return;
+    const id = currentJob;
+    try {
+      const r = await fetch("/api/jobs/" + id, { method: "DELETE", headers: authHeaders() });
+      if (r.ok) { setStatus("Cancelled."); finish(); }
+      else { setStatus(await errorText(r), true); }
+    } catch (e) { setStatus(String(e), true); }
+  });
+
   btnGen.addEventListener("click", async () => {
     btnGen.disabled = true; btnDl.disabled = true;
-    setStatus("Rendering&hellip; (LaTeX builds can take a while)");
+    setStatus("Submitting&hellip;");
     try {
       const form = new FormData();
       form.append("markdown", src.value);
-      const headers = {};
-      const tok = $("token").value.trim();
-      if (tok) headers["Authorization"] = "Bearer " + tok;
-      const r = await fetch("/api/pdf", { method: "POST", body: form, headers });
-      if (!r.ok) {
-        let msg = "HTTP " + r.status;
-        try {
-          const j = await r.json();
-          if (j.detail && j.detail.log) msg = j.detail.error + "\\n\\n" + j.detail.log;
-          else if (j.detail) msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
-        } catch (_) {}
-        setStatus(msg, true);
-        return;
+      const r = await fetch("/api/jobs", { method: "POST", body: form, headers: authHeaders() });
+      if (!r.ok) { setStatus(await errorText(r), true); finish(); return; }
+
+      const job = await r.json();
+      currentJob = job.job_id; polling = true;
+      btnCancel.hidden = false;
+      setStatus(describe(job));
+
+      // Poll until the build finishes. 1s is frequent enough to feel live
+      // without hammering a single-instance server.
+      while (polling) {
+        await sleep(1000);
+        if (!polling) return;
+        const sr = await fetch("/api/jobs/" + currentJob, { headers: authHeaders() });
+        if (!sr.ok) { setStatus(await errorText(sr), true); finish(); return; }
+        const s = await sr.json();
+
+        if (s.status === "done") {
+          const pr = await fetch(s.pdf_url, { headers: authHeaders() });
+          if (!pr.ok) { setStatus(await errorText(pr), true); finish(); return; }
+          showPdf(URL.createObjectURL(await pr.blob()));
+          finish();
+          return;
+        }
+        if (s.status === "error") {
+          setStatus((s.error || "Build failed") + "\\n\\n" + (s.log || ""), true);
+          finish(); return;
+        }
+        if (s.status === "cancelled") { setStatus("Cancelled."); finish(); return; }
+        setStatus(describe(s));
       }
-      showPdf(URL.createObjectURL(await r.blob()));
     } catch (e) {
       setStatus(String(e), true);
-    } finally {
-      btnGen.disabled = false;
+      finish();
     }
   });
 </script>
