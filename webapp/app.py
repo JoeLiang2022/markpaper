@@ -170,14 +170,25 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> bytes:
             raise BuildError("Font replacement step failed.", _tail(r.stderr))
 
         # ---- 4. Pandoc -> LaTeX ----------------------------------------- #
-        r = _run(
-            ["pandoc", "paper.tmp.md", "--standalone",
-             "--filter", "pandoc-crossref", "--citeproc",
-             "--csl=chicago-author-date.csl",
-             "-M", "title=", "-M", "author=", "-M", "date=",
-             "-o", "paper.tex"],
-            workdir, env, BUILD_TIMEOUT,
-        )
+        # paper.md configures CJK itself (YAML CJKmainfont + \usepackage{xeCJK}).
+        # Arbitrary pasted Markdown does not, so Chinese would come out as
+        # missing glyphs. Inject the detected CJK font when the document has no
+        # CJK setup of its own; pandoc's template then loads xeCJK for us.
+        # (Guarded by \ifXeTeX in the template, and we compile with xelatex.)
+        source_text = (workdir / "paper.tmp.md").read_text(encoding="utf-8",
+                                                           errors="replace")
+        declares_cjk = any(marker in source_text for marker in
+                           ("CJKmainfont", "xeCJK", "setCJKmainfont"))
+
+        pandoc_cmd = ["pandoc", "paper.tmp.md", "--standalone",
+                      "--filter", "pandoc-crossref", "--citeproc",
+                      "--csl=chicago-author-date.csl",
+                      "-M", "title=", "-M", "author=", "-M", "date="]
+        if not declares_cjk:
+            pandoc_cmd += ["-V", f"CJKmainfont={cjk_font}"]
+        pandoc_cmd += ["-o", "paper.tex"]
+
+        r = _run(pandoc_cmd, workdir, env, BUILD_TIMEOUT)
         if r.returncode != 0 or not (workdir / "paper.tex").exists():
             raise BuildError("Pandoc conversion failed.", _tail(r.stderr or r.stdout))
 
@@ -555,15 +566,16 @@ async def index() -> HTMLResponse:
 
 _STARTER_MARKDOWN = """\
 ---
-title: Hello, MarkPaper
 author: Anonymous
 ---
 
-# Introduction
+# Introduction 簡介
 
 This PDF was generated on demand from **Markdown** via Pandoc and XeLaTeX.
 
-- Plain text in, typeset PDF out.
+這份 PDF 是由 **Markdown** 即時產生的，中英文混排都支援。
+
+- Plain text in, typeset PDF out. 純文字輸入，輸出排版完成的 PDF。
 - Edit the Markdown on the left, then click *Generate PDF*.
 """
 
@@ -617,7 +629,19 @@ _INDEX_HTML = """\
   <button id="generate" type="button">Generate PDF</button>
 </header>
 <main>
-  <textarea id="src" spellcheck="false" placeholder="Paste Markdown here..."></textarea>
+  <textarea id="src" spellcheck="false" placeholder="Paste Markdown here...">---
+author: Anonymous
+---
+
+# Introduction 簡介
+
+This PDF was generated on demand from **Markdown** via Pandoc and XeLaTeX.
+
+這份 PDF 是由 **Markdown** 即時產生的，中英文混排都支援。
+
+- Plain text in, typeset PDF out. 純文字輸入，輸出排版完成的 PDF。
+- Edit the Markdown on the left, then click *Generate PDF*.
+</textarea>
   <div class="preview">
     <iframe id="frame" title="PDF preview"></iframe>
     <div class="status" id="status">Click <strong>&nbsp;Generate PDF&nbsp;</strong> to render.</div>
@@ -629,9 +653,6 @@ _INDEX_HTML = """\
   const btnGen = $("generate"), btnEx = $("loadExample"), btnDl = $("download");
   const btnCancel = $("cancel");
   let lastUrl = null, currentJob = null, polling = false;
-
-  const starter = `---\\ntitle: Hello, MarkPaper\\nauthor: Anonymous\\n---\\n\\n# Introduction\\n\\nThis PDF was generated on demand from **Markdown**.\\n`;
-  src.value = starter.replace(/\\\\n/g, "\\n");
 
   function setStatus(html, isError) {
     status.style.display = "flex";

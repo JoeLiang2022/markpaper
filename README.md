@@ -239,6 +239,14 @@ docker run --rm -p 8000:8000 markpaper-web
 | `SYNC_WAIT_TIMEOUT`  | `600`     | Max seconds `POST /api/pdf` waits before returning `504`       |
 | `ENABLE_MERMAID`     | `true`    | Set `false` to disable Mermaid rendering (saves memory/time)   |
 
+**Chinese / CJK output.** The web image installs `fonts-noto-cjk`, and the service auto-configures CJK typesetting: if your Markdown does not declare a CJK font itself, the detected font (normally *Noto Sans CJK TC*) is passed to Pandoc as `CJKmainfont`, which makes the LaTeX template load `xeCJK`. So plain Chinese Markdown with no YAML at all renders correctly. If you *do* want control, declare it yourself and the service leaves your choice alone:
+
+```yaml
+---
+CJKmainfont: Noto Sans CJK TC
+---
+```
+
 > **Security note**: This service compiles arbitrary user-supplied Markdown/LaTeX. XeLaTeX is run without shell-escape and with restricted file access (`openin_any=p`/`openout_any=p`), each build runs in an isolated temporary directory, and size/time/concurrency limits apply. Even so, treat a public instance as untrusted compute: **set `API_TOKEN`** for anything beyond a throwaway demo. The service is stateless and has no built-in authentication otherwise.
 
 > **Resource note**: `render.yaml` defaults to the **free** plan (512 MB, $0), which is fine for plain Markdown. Headless Chromium only starts when a document actually contains Mermaid diagrams, and that can exhaust 512 MB — if you hit out-of-memory errors on a Mermaid-heavy document, either set `ENABLE_MERMAID=false` or upgrade the plan (`starter`/`standard`). Free instances also sleep after ~15 minutes of inactivity and cold-start slowly because the image is large.

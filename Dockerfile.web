@@ -20,12 +20,20 @@ RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
         jq curl gnupg ca-certificates \
         fonts-liberation fonts-noto-color-emoji \
+        fonts-noto-cjk \
         libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
         libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
         libgbm1 libpangocairo-1.0-0 libcairo-gobject2 \
         libgtk-3-0 libgdk-pixbuf2.0-0 && \
+    fc-cache -f && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# Sanity-check that a CJK font really is available. tools/detect-fonts.sh looks
+# for "Noto Sans CJK TC" and otherwise falls back to a hardcoded name, so a
+# missing font would silently produce PDFs with no Chinese glyphs.
+RUN fc-list :lang=zh-tw | head -5 && \
+    fc-list | grep -qi "Noto Sans CJK" || { echo "ERROR: no CJK font installed"; exit 1; }
 
 # Install Node.js 22 LTS. The base image ships Node 18, which is too old for the
 # current mermaid-cli / puppeteer packages (they use the RegExp `v` flag that
