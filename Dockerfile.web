@@ -62,10 +62,30 @@ RUN apt-get update -qq && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install placeins LaTeX package for FloatBarrier support.
-RUN tlmgr option repository https://mirror.math.princeton.edu/pub/CTAN/systems/texlive/tlnet && \
-    tlmgr update --self && \
-    tlmgr install placeins
+# Install placeins LaTeX package (required: paper.md's header-includes uses
+# \usepackage{placeins} and \FloatBarrier).
+#
+# The image ships a fixed TeX Live release, but CTAN's main "tlnet" tree tracks
+# the newest release. Once CTAN rolls over, tlmgr refuses to talk to it
+# ("Local TeX Live (N) is older than remote repository (N+1)"). So pin the
+# frozen historic repository matching the installed release, and do NOT run
+# "tlmgr update --self" (cross-release self-update is what fails).
+RUN set -eu; \
+    TLYEAR="$(tlmgr --version 2>/dev/null | sed -n 's/.*version \([0-9]\{4\}\).*/\1/p' | tail -1)"; \
+    [ -n "$TLYEAR" ] || TLYEAR=2025; \
+    echo "Detected TeX Live ${TLYEAR}"; \
+    for base in \
+        "https://ftp.math.utah.edu/pub/tex/historic" \
+        "https://ftp.tu-chemnitz.de/pub/tug/historic" \
+        "https://mirror.ctan.org/systems/texlive/tlnet" ; do \
+        case "$base" in \
+            *historic) repo="${base}/systems/texlive/${TLYEAR}/tlnet-final" ;; \
+            *)         repo="$base" ;; \
+        esac; \
+        echo "Trying TeX Live repository: ${repo}"; \
+        if tlmgr option repository "$repo" && tlmgr install placeins; then break; fi; \
+    done; \
+    kpsewhich placeins.sty || { echo "ERROR: placeins.sty not installed"; exit 1; }
 
 # --- Web service layer ------------------------------------------------------ #
 
