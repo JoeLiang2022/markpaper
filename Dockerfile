@@ -62,7 +62,14 @@ RUN apt-get update -qq && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install placeins LaTeX package for FloatBarrier support.
+# Install the LaTeX packages this workflow needs beyond the base image's
+# (reduced) TeX Live scheme:
+#   placeins - \FloatBarrier, used by paper.md's header-includes
+#   xecjk    - provides xeCJK.sty, required for ANY Chinese/CJK typesetting
+#
+# xeCJK matters more than it looks: xelatex runs with -interaction=nonstopmode,
+# so a missing xeCJK does not fail the build - LaTeX carries on and produces a
+# perfectly valid PDF with every CJK glyph silently dropped. Assert it exists.
 # Pin a known-good CTAN mirror to avoid transient mirror signature issues.
 #
 # The image ships a fixed TeX Live release, but CTAN's main "tlnet" tree tracks
@@ -71,26 +78,26 @@ RUN apt-get update -qq && \
 # frozen historic repository matching the installed release, and do NOT run
 # "tlmgr update --self" (cross-release self-update is what fails).
 RUN set -eu; \
-    if kpsewhich placeins.sty >/dev/null 2>&1; then \
-        echo "placeins.sty already present"; \
+    need=""; \
+    kpsewhich placeins.sty >/dev/null 2>&1 || need="$need placeins"; \
+    kpsewhich xeCJK.sty    >/dev/null 2>&1 || need="$need xecjk"; \
+    if [ -z "$need" ]; then \
+        echo "placeins + xeCJK already present"; \
     else \
+        echo "Missing TeX packages:$need"; \
         TLYEAR="$(tlmgr --version 2>/dev/null | sed -n 's/.*version \([0-9]\{4\}\).*/\1/p' | tail -1)"; \
         [ -n "$TLYEAR" ] || TLYEAR=2025; \
         echo "Detected TeX Live ${TLYEAR}"; \
-        # Historic archives are signed with a now-expired key, so skip repo
-        # verification (--verify-repo=none) or tlmgr refuses to proceed.
         for base in \
             "https://ftp.math.utah.edu/pub/tex/historic" \
             "https://ftp.tu-chemnitz.de/pub/tug/historic" ; do \
             repo="${base}/systems/texlive/${TLYEAR}/tlnet-final"; \
             echo "Trying TeX Live repository: ${repo}"; \
-            tlmgr --repository "$repo" --verify-repo=none install placeins || true; \
-            if kpsewhich placeins.sty >/dev/null 2>&1; then break; fi; \
+            tlmgr --repository "$repo" --verify-repo=none install $need || true; \
+            if kpsewhich placeins.sty >/dev/null 2>&1 && kpsewhich xeCJK.sty >/dev/null 2>&1; then break; fi; \
         done; \
-        # Last resort: placeins is a single public-domain .sty file, so fetch it
-        # straight from CTAN into TEXMFLOCAL. Avoids all tlmgr mirror/key issues.
         if ! kpsewhich placeins.sty >/dev/null 2>&1; then \
-            echo "Falling back to direct CTAN download"; \
+            echo "Falling back to direct CTAN download for placeins"; \
             TEXMFLOCAL="$(kpsewhich -var-value=TEXMFLOCAL)"; \
             mkdir -p "${TEXMFLOCAL}/tex/latex/placeins"; \
             curl -fsSL -o "${TEXMFLOCAL}/tex/latex/placeins/placeins.sty" \
@@ -98,7 +105,8 @@ RUN set -eu; \
             mktexlsr; \
         fi; \
     fi; \
-    kpsewhich placeins.sty || { echo "ERROR: placeins.sty not installed"; exit 1; }
+    kpsewhich placeins.sty || { echo "ERROR: placeins.sty not installed"; exit 1; }; \
+    kpsewhich xeCJK.sty    || { echo "ERROR: xeCJK.sty not installed (CJK would silently vanish)"; exit 1; }
 
 # Keep the same entrypoint as base image
 ENTRYPOINT [""]

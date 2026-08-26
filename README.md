@@ -184,6 +184,7 @@ Unlike `devops.sh` (which orchestrates Docker from your host), the web service r
 | `DELETE /api/jobs/{id}`   | Cancel a queued job, or discard a finished one                     |
 | `POST /api/pdf`           | Submit **and wait**; returns `application/pdf` in one call         |
 | `GET /api/example`        | Returns the bundled `paper.md` so you can try the full example     |
+| `GET /api/diag`           | Toolchain report: pandoc/xelatex versions, `xeCJK.sty`, CJK fonts  |
 | `GET /healthz`            | Health check (used by Render); also reports queue depth            |
 
 **Multi-user behaviour.** Builds are slow and memory-hungry, so at most `MAX_CONCURRENCY` run at a time (default `1`) and the rest queue. Any number of people can use the service concurrently:
@@ -239,7 +240,14 @@ docker run --rm -p 8000:8000 markpaper-web
 | `SYNC_WAIT_TIMEOUT`  | `600`     | Max seconds `POST /api/pdf` waits before returning `504`       |
 | `ENABLE_MERMAID`     | `true`    | Set `false` to disable Mermaid rendering (saves memory/time)   |
 
-**Chinese / CJK output.** The web image installs `fonts-noto-cjk`, and the service auto-configures CJK typesetting: if your Markdown does not declare a CJK font itself, the detected font (normally *Noto Sans CJK TC*) is passed to Pandoc as `CJKmainfont`, which makes the LaTeX template load `xeCJK`. So plain Chinese Markdown with no YAML at all renders correctly. If you *do* want control, declare it yourself and the service leaves your choice alone:
+**Chinese / CJK output.** Two things are required and both are easy to get wrong silently:
+
+1. **A CJK font** — the image installs `fonts-noto-cjk`.
+2. **`xeCJK.sty`** — the base image ships a *reduced* TeX Live scheme, so `xecjk` is installed explicitly.
+
+Neither failure is loud. XeLaTeX runs with `-interaction=nonstopmode`, so if `xeCJK` or the font is missing it still emits a valid-looking PDF with **every Chinese character silently dropped**. Both Dockerfiles therefore assert these exist at build time, and the service scans the LaTeX log and reports dropped glyphs as warnings on the result instead of handing you a quietly wrong PDF. Use `GET /api/diag` to confirm what a running instance actually has.
+
+Given those, the service auto-configures CJK: if your Markdown does not declare a CJK font itself, it injects `\usepackage{xeCJK}` plus the detected font (normally *Noto Sans CJK TC*) into the preamble, so plain Chinese Markdown with no YAML at all renders correctly. If you *do* want control, declare it yourself and the service leaves your choice alone:
 
 ```yaml
 ---

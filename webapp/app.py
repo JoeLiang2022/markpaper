@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -93,12 +94,46 @@ def _tail(text: str, lines: int = 40) -> str:
     return "\n".join((text or "").splitlines()[-lines:])
 
 
-def build_pdf(markdown: str, bib: Optional[str] = None) -> bytes:
+def _scan_log(log: str) -> list[str]:
     """
-    Compile `markdown` into PDF bytes using the MarkPaper pipeline.
+    Pull problems out of a XeLaTeX log that did not stop the build.
 
-    Runs entirely inside a throwaway working directory so concurrent requests
-    never clobber each other. Reuses the repo's tools/ scripts and CSL file.
+    Because we run with -interaction=nonstopmode, LaTeX produces a PDF even
+    after errors. The nastiest case is a missing xeCJK or CJK font: the PDF
+    looks fine but every Chinese character is gone. Callers surface these so a
+    silently broken document is visible instead of merely wrong.
+    """
+    warnings: list[str] = []
+
+    missing_chars = re.findall(r"Missing character: There is no (\S+)", log)
+    if missing_chars:
+        sample = " ".join(sorted(set(missing_chars))[:12])
+        warnings.append(
+            f"{len(missing_chars)} character(s) had no glyph in the selected "
+            f"font and were dropped from the PDF (e.g. {sample}). "
+            "If this is Chinese/CJK text, the CJK font or xeCJK is unavailable."
+        )
+
+    for missing_file in sorted(set(re.findall(r"File `([^']+)' not found", log))):
+        warnings.append(f"LaTeX could not find: {missing_file}")
+
+    for bad_font in sorted(set(re.findall(r"The font \"([^\"]+)\" cannot be found", log))):
+        warnings.append(f"Font not found: {bad_font}")
+
+    if "Package xeCJK Error" in log:
+        warnings.append("xeCJK reported an error; CJK text may be missing.")
+
+    return warnings
+
+
+def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str]]:
+    """
+    Compile `markdown` into a PDF using the MarkPaper pipeline.
+
+    Returns the PDF bytes plus any non-fatal problems found in the XeLaTeX log
+    (see _scan_log). Runs entirely inside a throwaway working directory so
+    concurrent requests never clobber each other. Reuses the repo's tools/
+    scripts and CSL file.
     """
     if not markdown.strip():
         raise BuildError("Empty Markdown input.")
@@ -185,7 +220,16 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> bytes:
                       "--csl=chicago-author-date.csl",
                       "-M", "title=", "-M", "author=", "-M", "date="]
         if not declares_cjk:
-            pandoc_cmd += ["-V", f"CJKmainfont={cjk_font}"]
+            # Write the preamble ourselves rather than relying on the template's
+            # optional CJKmainfont variable: --include-in-header is additive and
+            # behaves the same across pandoc versions and templates.
+            (workdir / "cjk-header.tex").write_text(
+                "\\usepackage{xeCJK}\n"
+                f"\\setCJKmainfont{{{cjk_font}}}\n"
+                "\\xeCJKsetup{AutoFakeBold=true, AutoFakeSlant=true}\n",
+                encoding="utf-8",
+            )
+            pandoc_cmd += ["--include-in-header=cjk-header.tex"]
         pandoc_cmd += ["-o", "paper.tex"]
 
         r = _run(pandoc_cmd, workdir, env, BUILD_TIMEOUT)
@@ -202,17 +246,20 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> bytes:
                 workdir, env, BUILD_TIMEOUT,
             )
 
+        log_text = ""
+        log_file = workdir / "paper.log"
+        if log_file.exists():
+            log_text = log_file.read_text(encoding="utf-8", errors="replace")
+
         pdf_path = workdir / "paper.pdf"
         if not pdf_path.exists():
-            log = ""
-            log_file = workdir / "paper.log"
-            if log_file.exists():
-                log = _tail(log_file.read_text(encoding="utf-8", errors="replace"), 50)
-            else:
-                log = _tail(r.stdout or r.stderr)
-            raise BuildError("XeLaTeX failed to produce a PDF.", log)
+            raise BuildError("XeLaTeX failed to produce a PDF.",
+                             _tail(log_text, 50) or _tail(r.stdout or r.stderr))
 
-        return pdf_path.read_bytes()
+        # nonstopmode means LaTeX happily emits a PDF even after real errors
+        # (a missing xeCJK, for instance, silently drops every CJK glyph), so
+        # inspect the log and report anything that corrupts the output.
+        return pdf_path.read_bytes(), _scan_log(log_text)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -242,6 +289,7 @@ class Job:
     pdf: Optional[bytes] = None
     error: Optional[str] = None
     log: str = ""
+    warnings: list[str] = field(default_factory=list)
     done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -304,7 +352,8 @@ async def _worker() -> None:
             try:
                 # build_pdf is blocking; run it off the event loop so status
                 # polling and health checks stay responsive during a build.
-                job.pdf = await asyncio.to_thread(build_pdf, job.markdown, job.bib)
+                job.pdf, job.warnings = await asyncio.to_thread(
+                    build_pdf, job.markdown, job.bib)
                 job.status = "done"
             except BuildError as exc:
                 job.status, job.error, job.log = "error", str(exc), exc.log
@@ -380,6 +429,7 @@ def _job_state(job: Job) -> dict:
     if job.status == "done":
         state["pdf_url"] = f"/api/jobs/{job.id}/pdf"
         state["size_bytes"] = len(job.pdf or b"")
+        state["warnings"] = job.warnings
     if job.status == "error":
         state["error"] = job.error
         state["log"] = job.log
@@ -431,12 +481,14 @@ async def _extract_input(
     return content, bib
 
 
-def _pdf_response(pdf: bytes) -> Response:
-    return Response(
-        content=pdf,
-        media_type="application/pdf",
-        headers={"Content-Disposition": 'inline; filename="paper.pdf"'},
-    )
+def _pdf_response(pdf: bytes, warnings: Optional[list[str]] = None) -> Response:
+    headers = {"Content-Disposition": 'inline; filename="paper.pdf"'}
+    if warnings:
+        # Surface non-fatal problems (e.g. dropped CJK glyphs) to API callers,
+        # who otherwise receive a valid-looking but wrong PDF. Newlines are not
+        # allowed in header values, so join with " | ".
+        headers["X-MarkPaper-Warnings"] = " | ".join(warnings).replace("\n", " ")
+    return Response(content=pdf, media_type="application/pdf", headers=headers)
 
 
 @app.get("/healthz")
@@ -447,6 +499,59 @@ async def healthz() -> JSONResponse:
         "running": _running_count(),
         "workers": max(1, MAX_CONCURRENCY),
     })
+
+
+@app.get("/api/diag")
+async def api_diag(request: Request) -> JSONResponse:
+    """
+    Report what the container actually provides.
+
+    Exists because CJK failures are silent: without a CJK font or xeCJK.sty the
+    service still returns a valid PDF with the Chinese missing. Hit this to see
+    whether the toolchain is really complete.
+    """
+    _check_auth(request)
+
+    def probe() -> dict:
+        out: dict = {"root": str(APP_ROOT), "enable_mermaid": ENABLE_MERMAID}
+
+        def first_line(cmd: list[str]) -> str:
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                return ((r.stdout or r.stderr).strip().splitlines() or [""])[0]
+            except Exception as exc:                      # noqa: BLE001
+                return f"unavailable: {exc}"
+
+        out["pandoc"] = first_line(["pandoc", "--version"])
+        out["xelatex"] = first_line(["xelatex", "--version"])
+
+        # LaTeX packages that silently break output when absent.
+        for sty in ("xeCJK.sty", "placeins.sty"):
+            out[sty] = first_line(["kpsewhich", sty]) or "NOT FOUND"
+
+        # What detect-fonts.sh will hand the pipeline.
+        try:
+            r = subprocess.run(["bash", str(TOOLS_DIR / "detect-fonts.sh")],
+                               capture_output=True, text=True, timeout=60,
+                               cwd=str(APP_ROOT))
+            out["detect_fonts"] = (r.stdout or "").strip().splitlines()
+        except Exception as exc:                          # noqa: BLE001
+            out["detect_fonts"] = f"unavailable: {exc}"
+
+        # Installed CJK families, straight from fontconfig.
+        try:
+            r = subprocess.run(["fc-list", ":lang=zh-tw", "family"],
+                               capture_output=True, text=True, timeout=30)
+            families = sorted({line.strip() for line in
+                               (r.stdout or "").splitlines() if line.strip()})
+            out["cjk_family_count"] = len(families)
+            out["cjk_families"] = families[:25]
+        except Exception as exc:                          # noqa: BLE001
+            out["cjk_families"] = f"unavailable: {exc}"
+
+        return out
+
+    return JSONResponse(await asyncio.to_thread(probe))
 
 
 @app.get("/api/example", response_class=PlainTextResponse)
@@ -490,7 +595,7 @@ async def api_job_pdf(request: Request, job_id: str) -> Response:
     if job.status != "done" or job.pdf is None:
         raise HTTPException(status_code=409,
                             detail=f"Job is '{job.status}', not ready.")
-    return _pdf_response(job.pdf)
+    return _pdf_response(job.pdf, job.warnings)
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -552,7 +657,7 @@ async def api_pdf(
         raise HTTPException(status_code=500,
                             detail=f"Build ended as '{job.status}'.")
 
-    return _pdf_response(job.pdf)
+    return _pdf_response(job.pdf, job.warnings)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -607,8 +712,12 @@ _INDEX_HTML = """\
              padding: 14px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
              font-size: 13px; line-height: 1.5; resize: none; outline: none;
              background: transparent; color: inherit; }
-  .preview { position: relative; background: #6b72801a; }
-  iframe { width: 100%; height: 100%; border: 0; }
+  .preview { position: relative; background: #6b72801a; display: flex;
+             flex-direction: column; }
+  iframe { width: 100%; flex: 1; border: 0; }
+  .warn { background: #b4530933; border-bottom: 1px solid #b45309;
+          padding: 8px 12px; font-size: 12px; line-height: 1.45; }
+  .warn strong { display: block; margin-bottom: 2px; }
   .status { position: absolute; inset: 0; display: flex; align-items: center;
             justify-content: center; padding: 24px; text-align: center; }
   pre { white-space: pre-wrap; word-break: break-word; font-size: 12px;
@@ -643,6 +752,7 @@ This PDF was generated on demand from **Markdown** via Pandoc and XeLaTeX.
 - Edit the Markdown on the left, then click *Generate PDF*.
 </textarea>
   <div class="preview">
+    <div class="warn" id="warn" hidden></div>
     <iframe id="frame" title="PDF preview"></iframe>
     <div class="status" id="status">Click <strong>&nbsp;Generate PDF&nbsp;</strong> to render.</div>
   </div>
@@ -667,6 +777,21 @@ This PDF was generated on demand from **Markdown** via Pandoc and XeLaTeX.
     frame.style.display = "block";
     status.style.display = "none";
     btnDl.disabled = false;
+  }
+
+  function showWarnings(list) {
+    const warn = $("warn");
+    if (!list || !list.length) { warn.hidden = true; warn.textContent = ""; return; }
+    warn.innerHTML = "<strong>The PDF was produced, but with problems:</strong>";
+    const ul = document.createElement("ul");
+    ul.style.margin = "4px 0 0 18px";
+    list.forEach((w) => {
+      const li = document.createElement("li");
+      li.textContent = w;
+      ul.appendChild(li);
+    });
+    warn.appendChild(ul);
+    warn.hidden = false;
   }
 
   btnEx.addEventListener("click", async () => {
@@ -733,6 +858,7 @@ This PDF was generated on demand from **Markdown** via Pandoc and XeLaTeX.
 
   btnGen.addEventListener("click", async () => {
     btnGen.disabled = true; btnDl.disabled = true;
+    showWarnings([]);
     setStatus("Submitting&hellip;");
     try {
       const form = new FormData();
@@ -758,6 +884,7 @@ This PDF was generated on demand from **Markdown** via Pandoc and XeLaTeX.
           const pr = await fetch(s.pdf_url, { headers: authHeaders() });
           if (!pr.ok) { setStatus(await errorText(pr), true); finish(); return; }
           showPdf(URL.createObjectURL(await pr.blob()));
+          showWarnings(s.warnings);
           finish();
           return;
         }
