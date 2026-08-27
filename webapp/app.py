@@ -63,8 +63,11 @@ ENABLE_MERMAID = os.environ.get("ENABLE_MERMAID", "true").lower() not in ("0", "
 MEM_LIMIT_MB = int(os.environ.get("MEM_LIMIT_MB", "380"))
 # Primary LaTeX engine, and the engine to retry with when the primary cannot
 # load fonts. Set FALLBACK_ENGINE empty to disable the retry.
-PDF_ENGINE = os.environ.get("PDF_ENGINE", "xelatex")
-FALLBACK_ENGINE = os.environ.get("FALLBACK_ENGINE", "lualatex").strip()
+# LuaLaTeX is primary: this image's XeTeX font path is broken (unicode-math
+# calls the removed \l__fontspec_script_int, so every \setmainfont fails), and
+# attempting xelatex first only burned time and memory on a doomed run.
+PDF_ENGINE = os.environ.get("PDF_ENGINE", "lualatex")
+FALLBACK_ENGINE = os.environ.get("FALLBACK_ENGINE", "xelatex").strip()
 API_TOKEN = os.environ.get("API_TOKEN", "").strip()                  # optional bearer token
 
 # Job queue knobs
@@ -203,7 +206,15 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         env["openin_any"] = "p"    # paranoid: no absolute/parent-dir reads
         env["openout_any"] = "p"
         env["shell_escape"] = "f"
-        env["TEXMFVAR"] = str(workdir / ".texmf-var")
+        # Deliberately do NOT point TEXMFVAR at the per-request directory.
+        # LuaLaTeX's luaotfload has to parse the (very large) CJK font and cache
+        # the result under TEXMFVAR. With a fresh directory per request - and
+        # openout_any=p refusing absolute-path writes anyway - that cache could
+        # never persist, so every single build re-parsed the font in memory.
+        # That is what made builds slow and pushed the instance over its memory
+        # limit. The image pre-warms a shared cache at build time and TEXMFVAR
+        # points there, so requests only read it. It holds font caches only, no
+        # document data, so sharing it does not weaken per-request isolation.
 
         # ---- 1. Mermaid diagrams ---------------------------------------- #
         # Only invoke the Mermaid step when the document actually contains a
@@ -310,11 +321,10 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         engine_used = PDF_ENGINE
         ok, log_text, r = run_engine(engine_used)
 
-        broken_xetex_fonts = (
-            "XeTeXOTfeaturetag with nullfont" in log_text
-            or "l__fontspec_script_int" in log_text
-        )
-        if not ok and broken_xetex_fonts and FALLBACK_ENGINE:
+        # Any failure is worth one attempt with the other engine: the two use
+        # completely different font machinery (luaotfload vs XeTeX), so a fault
+        # in one often does not exist in the other.
+        if not ok and FALLBACK_ENGINE and FALLBACK_ENGINE != PDF_ENGINE:
             engine_used = FALLBACK_ENGINE
             ok, log_text, r = run_engine(engine_used)
 

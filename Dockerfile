@@ -148,7 +148,7 @@ RUN set -eu; \
     printf '%s\n' '# 繁體中文測試 Traditional Chinese' '' '測試內文 123.' > t.md; \
     pandoc t.md --standalone -V mainfont='Noto Sans CJK TC' -o t.tex; \
     ok=""; \
-    for engine in xelatex lualatex; do \
+    for engine in lualatex xelatex; do \
         rm -f t.pdf t.log; \
         if "$engine" -interaction=nonstopmode t.tex > out.log 2>&1 && [ -f t.pdf ]; then \
             if grep -q "Missing character" t.log 2>/dev/null; then \

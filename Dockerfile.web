@@ -148,20 +148,31 @@ RUN set -eu; \
     done; \
     fmtutil-sys --byfmt xelatex || fmtutil-sys --all || true
 
-# End-to-end CJK check, driven through pandoc so it exercises the real runtime
-# path. A hand-written \usepackage{fontspec} file is NOT enough: pandoc's
-# template also loads unicode-math, and it was unicode-math that broke
-# \setmainfont while a plain fontspec document compiled fine - so the earlier
-# version of this test passed and the image still failed on real requests.
+# Shared, pre-warmed TeX cache.
 #
-# At least one engine must work; the service falls back to lualatex when
-# xelatex cannot load fonts, so accept either here and report which.
+# LuaLaTeX's luaotfload must parse the (large) Noto CJK font and cache the
+# result under TEXMFVAR. At request time the service runs with openout_any=p,
+# so it cannot write an absolute path - meaning without a pre-built cache every
+# request re-parses the font in memory. That was making builds slow and pushing
+# the 512 MB instance over its limit. Build the cache here, once, as root.
+ENV TEXMFVAR=/var/lib/markpaper-texmf
+RUN mkdir -p "$TEXMFVAR" && chmod 777 "$TEXMFVAR"
+
+# End-to-end CJK check, driven through pandoc so it exercises the real runtime
+# path, and doubling as the cache warm-up.
+#
+# A hand-written \usepackage{fontspec} file is NOT enough: pandoc's template
+# also loads unicode-math, and it was unicode-math that broke \setmainfont while
+# a plain fontspec document compiled fine - so the earlier version of this test
+# passed and the image still failed on real requests.
+#
+# lualatex is tried first because it is the service's primary engine.
 RUN set -eu; \
     tmp="$(mktemp -d)"; cd "$tmp"; \
     printf '%s\n' '# 繁體中文測試 Traditional Chinese' '' '測試內文 123.' > t.md; \
     pandoc t.md --standalone -V mainfont='Noto Sans CJK TC' -o t.tex; \
     ok=""; \
-    for engine in xelatex lualatex; do \
+    for engine in lualatex xelatex; do \
         rm -f t.pdf t.log; \
         if "$engine" -interaction=nonstopmode t.tex > out.log 2>&1 && [ -f t.pdf ]; then \
             if grep -q "Missing character" t.log 2>/dev/null; then \
@@ -176,7 +187,9 @@ RUN set -eu; \
     done; \
     [ -n "$ok" ] || { echo "ERROR: no LaTeX engine can typeset CJK via pandoc"; exit 1; }; \
     echo "CJK smoke test OK using $ok"; \
-    cd /; rm -rf "$tmp"
+    cd /; rm -rf "$tmp"; \
+    chmod -R 777 "$TEXMFVAR"; \
+    echo "TEXMFVAR cache size: $(du -sh "$TEXMFVAR" | cut -f1)"
 
 # --- Web service layer ------------------------------------------------------ #
 
