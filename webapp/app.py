@@ -252,10 +252,13 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
             # Write the preamble ourselves rather than relying on the template's
             # optional CJKmainfont variable: --include-in-header is additive and
             # behaves the same across pandoc versions and templates.
+            # Keep this minimal. An \xeCJKsetup{AutoFakeBold=...} line here used
+            # to abort the run: in the preamble no font is selected yet, so it
+            # hit "Cannot use \XeTeXOTfeaturetag with nullfont" 100 times and
+            # xelatex gave up. Noto CJK ships real bold anyway.
             (workdir / "cjk-header.tex").write_text(
                 "\\usepackage{xeCJK}\n"
-                f"\\setCJKmainfont{{{cjk_font}}}\n"
-                "\\xeCJKsetup{AutoFakeBold=true, AutoFakeSlant=true}\n",
+                f"\\setCJKmainfont{{{cjk_font}}}\n",
                 encoding="utf-8",
             )
             pandoc_cmd += ["--include-in-header=cjk-header.tex"]
