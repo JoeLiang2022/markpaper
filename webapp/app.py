@@ -505,6 +505,11 @@ async def healthz() -> JSONResponse:
         "queued": _queued_count(),
         "running": _running_count(),
         "workers": max(1, MAX_CONCURRENCY),
+        # Which build is actually serving traffic. Render injects these; without
+        # them it is easy to debug a version that was never deployed.
+        "commit": os.environ.get("RENDER_GIT_COMMIT", "unknown")[:12],
+        "branch": os.environ.get("RENDER_GIT_BRANCH", "unknown"),
+        "app_version": app.version,
     })
 
 
@@ -520,7 +525,12 @@ async def api_diag(request: Request) -> JSONResponse:
     _check_auth(request)
 
     def probe() -> dict:
-        out: dict = {"root": str(APP_ROOT), "enable_mermaid": ENABLE_MERMAID}
+        out: dict = {
+            "root": str(APP_ROOT),
+            "enable_mermaid": ENABLE_MERMAID,
+            "commit": os.environ.get("RENDER_GIT_COMMIT", "unknown")[:12],
+            "app_version": app.version,
+        }
 
         def first_line(cmd: list[str]) -> str:
             try:
