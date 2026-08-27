@@ -60,9 +60,11 @@ ENABLE_MERMAID = os.environ.get("ENABLE_MERMAID", "true").lower() not in ("0", "
 API_TOKEN = os.environ.get("API_TOKEN", "").strip()                  # optional bearer token
 
 # Job queue knobs
-JOB_TTL = int(os.environ.get("JOB_TTL", "900"))            # keep finished results (s)
+# Finished PDFs are held in RAM, and the free tier only has 512 MB, so retain
+# few results for a short time. Raise these if you run on a bigger instance.
+JOB_TTL = int(os.environ.get("JOB_TTL", "300"))            # keep finished results (s)
 MAX_QUEUE = int(os.environ.get("MAX_QUEUE", "50"))          # reject submissions beyond this
-MAX_STORED_RESULTS = int(os.environ.get("MAX_STORED_RESULTS", "20"))  # retained PDFs
+MAX_STORED_RESULTS = int(os.environ.get("MAX_STORED_RESULTS", "5"))   # retained PDFs
 SYNC_WAIT_TIMEOUT = int(os.environ.get("SYNC_WAIT_TIMEOUT", "600"))   # /api/pdf max wait
 
 
@@ -170,8 +172,13 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         env["TEXMFVAR"] = str(workdir / ".texmf-var")
 
         # ---- 1. Mermaid diagrams ---------------------------------------- #
+        # Only invoke the Mermaid step when the document actually contains a
+        # mermaid block. mmdc launches headless Chromium, which alone can
+        # exhaust a 512 MB instance and take the whole process down (OOM kill
+        # surfaces as a 502), so never pay that cost speculatively.
+        has_mermaid = "```mermaid" in markdown
         src_for_fonts = "paper.md"
-        if ENABLE_MERMAID:
+        if ENABLE_MERMAID and has_mermaid:
             r = _run(
                 ["bash", "tools/process-mermaid.sh", "paper.md", "paper.mermaid.tmp.md", "images"],
                 workdir, env, BUILD_TIMEOUT,
