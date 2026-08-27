@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -57,6 +58,9 @@ BUILD_TIMEOUT = int(os.environ.get("BUILD_TIMEOUT", "240"))          # seconds p
 MAX_INPUT_BYTES = int(os.environ.get("MAX_INPUT_BYTES", str(2 * 1024 * 1024)))  # 2 MiB
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "1"))         # simultaneous builds
 ENABLE_MERMAID = os.environ.get("ENABLE_MERMAID", "true").lower() not in ("0", "false", "no")
+# Address-space cap for xelatex/mmdc, in MiB. Sized to leave room for the web
+# process inside a 512 MB instance. 0 disables the cap.
+MEM_LIMIT_MB = int(os.environ.get("MEM_LIMIT_MB", "380"))
 API_TOKEN = os.environ.get("API_TOKEN", "").strip()                  # optional bearer token
 
 # Job queue knobs
@@ -90,6 +94,24 @@ def _run(cmd: list[str], cwd: Path, env: dict, timeout: int) -> subprocess.Compl
         text=True,
         timeout=timeout,
     )
+
+
+def _run_capped(cmd: list[str], cwd: Path, env: dict, timeout: int) -> subprocess.CompletedProcess:
+    """
+    Run a memory-hungry child under an address-space limit.
+
+    Without this, a runaway xelatex (or Chromium) pushes the container past its
+    memory limit and the platform kills/restarts the *whole service* - which
+    users experience as an HTTP 502 and a lost job. Capping the child means it
+    is the child that dies, so the request fails with a real error message and
+    the server keeps serving. Set MEM_LIMIT_MB=0 to disable.
+    """
+    if MEM_LIMIT_MB > 0 and os.name == "posix":
+        inner = " ".join(shlex.quote(part) for part in cmd)
+        wrapped = ["bash", "-c",
+                   f"ulimit -v {MEM_LIMIT_MB * 1024} 2>/dev/null || true; exec {inner}"]
+        return _run(wrapped, cwd, env, timeout)
+    return _run(cmd, cwd, env, timeout)
 
 
 def _tail(text: str, lines: int = 40) -> str:
@@ -179,7 +201,7 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         has_mermaid = "```mermaid" in markdown
         src_for_fonts = "paper.md"
         if ENABLE_MERMAID and has_mermaid:
-            r = _run(
+            r = _run_capped(
                 ["bash", "tools/process-mermaid.sh", "paper.md", "paper.mermaid.tmp.md", "images"],
                 workdir, env, BUILD_TIMEOUT,
             )
@@ -248,7 +270,7 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
 
         # ---- 6. XeLaTeX (two passes for references/TOC) ----------------- #
         for _ in range(2):
-            r = _run(
+            r = _run_capped(
                 ["xelatex", "-interaction=nonstopmode", "-no-shell-escape", "paper.tex"],
                 workdir, env, BUILD_TIMEOUT,
             )
@@ -260,8 +282,18 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
 
         pdf_path = workdir / "paper.pdf"
         if not pdf_path.exists():
-            raise BuildError("XeLaTeX failed to produce a PDF.",
-                             _tail(log_text, 50) or _tail(r.stdout or r.stderr))
+            detail = _tail(log_text, 50) or _tail(r.stdout or r.stderr)
+            # A child killed by the address-space cap (or the kernel) leaves no
+            # useful LaTeX error, so say so rather than showing an empty log.
+            killed = r.returncode is not None and r.returncode < 0
+            if killed or not detail.strip():
+                detail = (
+                    (detail + "\n\n" if detail.strip() else "")
+                    + f"xelatex exited abnormally (code {r.returncode}). This is "
+                      f"usually the {MEM_LIMIT_MB} MiB memory cap being hit. Try a "
+                      "smaller document, or raise MEM_LIMIT_MB on a larger instance."
+                )
+            raise BuildError("XeLaTeX failed to produce a PDF.", detail)
 
         # nonstopmode means LaTeX happily emits a PDF even after real errors
         # (a missing xeCJK, for instance, silently drops every CJK glyph), so
