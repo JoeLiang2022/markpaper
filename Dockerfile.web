@@ -127,6 +127,50 @@ RUN set -eu; \
     kpsewhich placeins.sty || { echo "ERROR: placeins.sty not installed"; exit 1; }; \
     kpsewhich xeCJK.sty    || { echo "ERROR: xeCJK.sty not installed (CJK would silently vanish)"; exit 1; }
 
+# Repair the font stack. Any \setmainfont in this image failed with
+#   "Cannot use \XeTeXOTfeaturetag with nullfont"
+#   "Missing = inserted for \ifnum ... \l__fontspec_script_int"
+# i.e. fontspec's internals disagree with what the precompiled xelatex format
+# was built against. Reinstall the fontspec/expl3 stack from the frozen
+# repository and regenerate the format so the two match.
+RUN set -eu; \
+    TLYEAR="$(tlmgr --version 2>/dev/null | sed -n 's/.*version \([0-9]\{4\}\).*/\1/p' | tail -1)"; \
+    [ -n "$TLYEAR" ] || TLYEAR=2025; \
+    for base in \
+        "https://ftp.math.utah.edu/pub/tex/historic" \
+        "https://ftp.tu-chemnitz.de/pub/tug/historic" ; do \
+        repo="${base}/systems/texlive/${TLYEAR}/tlnet-final"; \
+        echo "Reinstalling font stack from ${repo}"; \
+        if tlmgr --repository "$repo" --verify-repo=none install --reinstall \
+                l3kernel l3packages l3backend fontspec unicode-math xecjk; then \
+            break; \
+        fi; \
+    done; \
+    fmtutil-sys --byfmt xelatex || fmtutil-sys --all || true
+
+# End-to-end CJK check. Without this the image can ship "successfully" and only
+# fail at request time, which is how a broken font stack reached production.
+RUN set -eu; \
+    tmp="$(mktemp -d)"; cd "$tmp"; \
+    printf '%s\n' \
+        '\documentclass{article}' \
+        '\usepackage{fontspec}' \
+        '\setmainfont{Noto Sans CJK TC}' \
+        '\begin{document}' \
+        '繁體中文測試 Traditional Chinese 123' \
+        '\end{document}' > t.tex; \
+    if ! xelatex -interaction=nonstopmode -halt-on-error t.tex > out.log 2>&1; then \
+        echo "--- xelatex log (tail) ---"; tail -60 out.log; \
+        echo "ERROR: CJK smoke test failed to compile"; exit 1; \
+    fi; \
+    [ -f t.pdf ] || { tail -60 out.log; echo "ERROR: CJK smoke test produced no PDF"; exit 1; }; \
+    if grep -q "Missing character" out.log; then \
+        grep "Missing character" out.log | head -5; \
+        echo "ERROR: CJK glyphs were dropped - font does not cover Chinese"; exit 1; \
+    fi; \
+    echo "CJK smoke test OK ($(wc -c < t.pdf) bytes)"; \
+    cd /; rm -rf "$tmp"
+
 # --- Web service layer ------------------------------------------------------ #
 
 # Python web dependencies. The base image is Ubuntu (PEP 668 externally managed),
