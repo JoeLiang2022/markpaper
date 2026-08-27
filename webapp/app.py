@@ -147,6 +147,14 @@ def _scan_log(log: str) -> list[str]:
     if "Package xeCJK Error" in log:
         warnings.append("xeCJK reported an error; CJK text may be missing.")
 
+    if "XeTeXOTfeaturetag with nullfont" in log or "l__fontspec_script_int" in log:
+        warnings.append(
+            "xeCJK is incompatible with the installed fontspec in this image "
+            "(it uses the removed \\l__fontspec_script_int). Remove "
+            "CJKmainfont/xeCJK from the document and let the service set a CJK "
+            "mainfont instead."
+        )
+
     return warnings
 
 
@@ -241,27 +249,27 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         # (Guarded by \ifXeTeX in the template, and we compile with xelatex.)
         source_text = (workdir / "paper.tmp.md").read_text(encoding="utf-8",
                                                            errors="replace")
-        declares_cjk = any(marker in source_text for marker in
-                           ("CJKmainfont", "xeCJK", "setCJKmainfont"))
+        declares_fonts = any(marker in source_text for marker in
+                             ("CJKmainfont", "xeCJK", "setCJKmainfont",
+                              "mainfont", "setmainfont"))
 
         pandoc_cmd = ["pandoc", "paper.tmp.md", "--standalone",
                       "--filter", "pandoc-crossref", "--citeproc",
                       "--csl=chicago-author-date.csl",
                       "-M", "title=", "-M", "author=", "-M", "date="]
-        if not declares_cjk:
-            # Write the preamble ourselves rather than relying on the template's
-            # optional CJKmainfont variable: --include-in-header is additive and
-            # behaves the same across pandoc versions and templates.
-            # Keep this minimal. An \xeCJKsetup{AutoFakeBold=...} line here used
-            # to abort the run: in the preamble no font is selected yet, so it
-            # hit "Cannot use \XeTeXOTfeaturetag with nullfont" 100 times and
-            # xelatex gave up. Noto CJK ships real bold anyway.
-            (workdir / "cjk-header.tex").write_text(
-                "\\usepackage{xeCJK}\n"
-                f"\\setCJKmainfont{{{cjk_font}}}\n",
-                encoding="utf-8",
-            )
-            pandoc_cmd += ["--include-in-header=cjk-header.tex"]
+        if not declares_fonts:
+            # Set the *main* font to a CJK family rather than loading xeCJK.
+            #
+            # xeCJK in this image is incompatible with its fontspec: it calls
+            # \l__fontspec_script_int, which newer fontspec removed, so xelatex
+            # reports "Cannot use \XeTeXOTfeaturetag with nullfont" repeatedly,
+            # hits its 100-error limit and produces no PDF. Plain fontspec works
+            # fine (Latin-only documents build), so avoid xeCJK entirely.
+            #
+            # Noto CJK covers Latin as well as CJK, so a single mainfont handles
+            # a mixed document. `mainfont` is a documented pandoc variable that
+            # the template turns into \setmainfont, so no raw LaTeX is injected.
+            pandoc_cmd += ["-V", f"mainfont={cjk_font}"]
         pandoc_cmd += ["-o", "paper.tex"]
 
         r = _run(pandoc_cmd, workdir, env, BUILD_TIMEOUT)
