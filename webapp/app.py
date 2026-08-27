@@ -61,6 +61,10 @@ ENABLE_MERMAID = os.environ.get("ENABLE_MERMAID", "true").lower() not in ("0", "
 # Address-space cap for xelatex/mmdc, in MiB. Sized to leave room for the web
 # process inside a 512 MB instance. 0 disables the cap.
 MEM_LIMIT_MB = int(os.environ.get("MEM_LIMIT_MB", "380"))
+# Primary LaTeX engine, and the engine to retry with when the primary cannot
+# load fonts. Set FALLBACK_ENGINE empty to disable the retry.
+PDF_ENGINE = os.environ.get("PDF_ENGINE", "xelatex")
+FALLBACK_ENGINE = os.environ.get("FALLBACK_ENGINE", "lualatex").strip()
 API_TOKEN = os.environ.get("API_TOKEN", "").strip()                  # optional bearer token
 
 # Job queue knobs
@@ -279,37 +283,64 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         # ---- 5. Patch CSL / CJK preamble -------------------------------- #
         _run(["bash", "tools/fix-latex-csl.sh", "paper.tex"], workdir, env, 60)
 
-        # ---- 6. XeLaTeX (two passes for references/TOC) ----------------- #
-        for _ in range(2):
-            r = _run_capped(
-                ["xelatex", "-interaction=nonstopmode", "-no-shell-escape", "paper.tex"],
-                workdir, env, BUILD_TIMEOUT,
-            )
-
-        log_text = ""
-        log_file = workdir / "paper.log"
-        if log_file.exists():
-            log_text = log_file.read_text(encoding="utf-8", errors="replace")
-
+        # ---- 6. LaTeX (two passes each, for references/TOC) -------------- #
+        #
+        # XeLaTeX is the primary engine, but this image's XeTeX font path is
+        # broken: pandoc's template loads unicode-math, whose call to the
+        # now-removed \l__fontspec_script_int makes every \setmainfont fail with
+        # "Cannot use \XeTeXOTfeaturetag with nullfont" until LaTeX gives up.
+        # \XeTeXOTfeaturetag is XeTeX-specific, so LuaLaTeX (which goes through
+        # luaotfload) is unaffected. Fall back to it rather than failing.
         pdf_path = workdir / "paper.pdf"
-        if not pdf_path.exists():
-            detail = _tail(log_text, 50) or _tail(r.stdout or r.stderr)
+        log_file = workdir / "paper.log"
+
+        def run_engine(engine: str) -> tuple[bool, str, subprocess.CompletedProcess]:
+            for stale in (pdf_path, log_file):
+                stale.unlink(missing_ok=True)
+            result = None
+            for _ in range(2):
+                result = _run_capped(
+                    [engine, "-interaction=nonstopmode", "-no-shell-escape", "paper.tex"],
+                    workdir, env, BUILD_TIMEOUT,
+                )
+            text = (log_file.read_text(encoding="utf-8", errors="replace")
+                    if log_file.exists() else "")
+            return pdf_path.exists(), text, result
+
+        engine_used = PDF_ENGINE
+        ok, log_text, r = run_engine(engine_used)
+
+        broken_xetex_fonts = (
+            "XeTeXOTfeaturetag with nullfont" in log_text
+            or "l__fontspec_script_int" in log_text
+        )
+        if not ok and broken_xetex_fonts and FALLBACK_ENGINE:
+            engine_used = FALLBACK_ENGINE
+            ok, log_text, r = run_engine(engine_used)
+
+        if not ok:
+            detail = _tail(log_text, 50) or _tail(r.stdout or r.stderr if r else "")
             # A child killed by the address-space cap (or the kernel) leaves no
             # useful LaTeX error, so say so rather than showing an empty log.
-            killed = r.returncode is not None and r.returncode < 0
+            killed = r is not None and r.returncode is not None and r.returncode < 0
             if killed or not detail.strip():
                 detail = (
                     (detail + "\n\n" if detail.strip() else "")
-                    + f"xelatex exited abnormally (code {r.returncode}). This is "
-                      f"usually the {MEM_LIMIT_MB} MiB memory cap being hit. Try a "
-                      "smaller document, or raise MEM_LIMIT_MB on a larger instance."
+                    + f"{engine_used} exited abnormally (code "
+                      f"{r.returncode if r else '?'}). This is usually the "
+                      f"{MEM_LIMIT_MB} MiB memory cap being hit. Try a smaller "
+                      "document, or raise MEM_LIMIT_MB on a larger instance."
                 )
-            raise BuildError("XeLaTeX failed to produce a PDF.", detail)
+            raise BuildError(f"{engine_used} failed to produce a PDF.", detail)
 
         # nonstopmode means LaTeX happily emits a PDF even after real errors
-        # (a missing xeCJK, for instance, silently drops every CJK glyph), so
-        # inspect the log and report anything that corrupts the output.
-        return pdf_path.read_bytes(), _scan_log(log_text)
+        # (missing glyphs, for instance, vanish silently), so inspect the log
+        # and report anything that corrupts the output.
+        warnings = _scan_log(log_text)
+        if engine_used != PDF_ENGINE:
+            warnings.insert(0, f"Built with {engine_used} because {PDF_ENGINE} "
+                               "could not load fonts in this image.")
+        return pdf_path.read_bytes(), warnings
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

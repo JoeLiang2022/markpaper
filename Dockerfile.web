@@ -148,27 +148,34 @@ RUN set -eu; \
     done; \
     fmtutil-sys --byfmt xelatex || fmtutil-sys --all || true
 
-# End-to-end CJK check. Without this the image can ship "successfully" and only
-# fail at request time, which is how a broken font stack reached production.
+# End-to-end CJK check, driven through pandoc so it exercises the real runtime
+# path. A hand-written \usepackage{fontspec} file is NOT enough: pandoc's
+# template also loads unicode-math, and it was unicode-math that broke
+# \setmainfont while a plain fontspec document compiled fine - so the earlier
+# version of this test passed and the image still failed on real requests.
+#
+# At least one engine must work; the service falls back to lualatex when
+# xelatex cannot load fonts, so accept either here and report which.
 RUN set -eu; \
     tmp="$(mktemp -d)"; cd "$tmp"; \
-    printf '%s\n' \
-        '\documentclass{article}' \
-        '\usepackage{fontspec}' \
-        '\setmainfont{Noto Sans CJK TC}' \
-        '\begin{document}' \
-        '繁體中文測試 Traditional Chinese 123' \
-        '\end{document}' > t.tex; \
-    if ! xelatex -interaction=nonstopmode -halt-on-error t.tex > out.log 2>&1; then \
-        echo "--- xelatex log (tail) ---"; tail -60 out.log; \
-        echo "ERROR: CJK smoke test failed to compile"; exit 1; \
-    fi; \
-    [ -f t.pdf ] || { tail -60 out.log; echo "ERROR: CJK smoke test produced no PDF"; exit 1; }; \
-    if grep -q "Missing character" out.log; then \
-        grep "Missing character" out.log | head -5; \
-        echo "ERROR: CJK glyphs were dropped - font does not cover Chinese"; exit 1; \
-    fi; \
-    echo "CJK smoke test OK ($(wc -c < t.pdf) bytes)"; \
+    printf '%s\n' '# 繁體中文測試 Traditional Chinese' '' '測試內文 123.' > t.md; \
+    pandoc t.md --standalone -V mainfont='Noto Sans CJK TC' -o t.tex; \
+    ok=""; \
+    for engine in xelatex lualatex; do \
+        rm -f t.pdf t.log; \
+        if "$engine" -interaction=nonstopmode t.tex > out.log 2>&1 && [ -f t.pdf ]; then \
+            if grep -q "Missing character" t.log 2>/dev/null; then \
+                echo "$engine: produced a PDF but dropped glyphs"; \
+                grep "Missing character" t.log | head -3; \
+            else \
+                echo "$engine: OK ($(wc -c < t.pdf) bytes)"; ok="$engine"; break; \
+            fi; \
+        else \
+            echo "$engine: FAILED"; tail -25 out.log || true; \
+        fi; \
+    done; \
+    [ -n "$ok" ] || { echo "ERROR: no LaTeX engine can typeset CJK via pandoc"; exit 1; }; \
+    echo "CJK smoke test OK using $ok"; \
     cd /; rm -rf "$tmp"
 
 # --- Web service layer ------------------------------------------------------ #
