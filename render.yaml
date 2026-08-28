@@ -43,6 +43,14 @@ services:
       # Set to "true" on a plan with more memory (starter or larger).
       - key: ENABLE_MERMAID
         value: "false"
+      # CJK_FONT is intentionally NOT set here. Dockerfile.web owns it, because
+      # it also warms luaotfload's font cache for exactly that family (requests
+      # cannot write the cache themselves - openout_any=p). Overriding it from
+      # here or the dashboard works, but then every build re-parses the font in
+      # memory, which a 512 MB instance cannot afford. Measured: ~437 MB peak RSS
+      # for a one-line document with the small default font. If you want Noto
+      # Sans CJK back, move to a bigger plan and rebuild with
+      # --build-arg CJK_FONT="Noto Sans CJK TC".
       # SECURITY: this endpoint compiles arbitrary user Markdown/LaTeX.
       # By default the service is PUBLIC so the browser UI works out of the box.
       # To lock it down, add an environment variable named API_TOKEN in the

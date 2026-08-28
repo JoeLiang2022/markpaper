@@ -162,6 +162,18 @@ RUN set -eu; \
     done; \
     fmtutil-sys --byfmt xelatex || fmtutil-sys --all || true
 
+# The CJK font the service uses at runtime. This is deliberately the single
+# source of truth (rather than an entry in render.yaml) because the luaotfload
+# cache warmed below is per font: overriding CJK_FONT in the host's environment
+# works, but the override loses the warmed cache and every request then pays to
+# parse the font again in memory.
+#
+# Measured on a 512 MB instance: a one-line document needs ~437 MB peak RSS with
+# this (~10 MB) font, so the ~120 MB Noto Sans CJK collection cannot fit. Noto
+# stays installed for larger plans; see README.
+ARG CJK_FONT="AR PL UMing TW"
+ENV CJK_FONT=${CJK_FONT}
+
 # End-to-end CJK check, driven through pandoc so it exercises the real runtime
 # path, and doubling as a warm-up of luaotfload's font cache.
 #
@@ -179,11 +191,18 @@ RUN set -eu; \
 #    otherwise never exercise. Run the check unrestricted first (to build the
 #    cache as root) and then again restricted, and require both to pass.
 #
+# The unrestricted pass is not just a test: openout_any=p stops luaotfload from
+# ever *saving* its font cache at request time, so without warming it here every
+# single build re-parses the font in memory. That is why this compiles with
+# $CJK_FONT rather than a hardcoded family - warming a font the service does not
+# use is wasted work.
+#
 # lualatex is tried first because it is the service's primary engine.
 RUN set -eu; \
     tmp="$(mktemp -d)"; cd "$tmp"; \
     printf '%s\n' '# 繁體中文測試 Traditional Chinese' '' '測試內文 123.' > t.md; \
-    pandoc t.md --standalone -V mainfont='Noto Sans CJK TC' -o t.tex; \
+    echo "Warming/verifying CJK with font: ${CJK_FONT}"; \
+    pandoc t.md --standalone -V mainfont="${CJK_FONT}" -o t.tex; \
     for mode in unrestricted restricted; do \
         if [ "$mode" = restricted ]; then \
             export openin_any=r openout_any=p shell_escape=f; \

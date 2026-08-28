@@ -150,6 +150,23 @@ def _head(text: str, lines: int = 40) -> str:
     return "\n".join((text or "").splitlines()[:lines])
 
 
+def _log_finished(log: str) -> bool:
+    """
+    Did the engine reach the end of its run (even if it errored)?
+
+    Used to tell "LaTeX complained" from "the process was killed", which need
+    completely different fixes. The engines sign off differently: pdfTeX/XeTeX
+    print "Here is how much of TeX's memory you used", LuaTeX prints a "PDF
+    statistics" block instead - so testing only for the former reported every
+    LuaLaTeX run as killed.
+    """
+    return any(marker in log for marker in (
+        "Here is how much of TeX's memory you used",
+        "PDF statistics:",
+        "No pages of output",
+    ))
+
+
 def _child_peak_rss_kb() -> int:
     """Peak RSS across all reaped children, in KiB. 0 where unavailable."""
     try:
@@ -408,7 +425,7 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
             # A LaTeX run that merely errors still writes its usage summary. If
             # that is absent the process died mid-run, which the log alone makes
             # look like an unrelated font problem.
-            if "Here is how much of TeX's memory you used" not in log:
+            if not _log_finished(log):
                 head += (f"\n{engine} died before finishing (no LaTeX summary in "
                          f"the log). Usually the {MEM_LIMIT_MB} MiB address-space "
                          f"cap, or the container running out of memory.")
@@ -816,7 +833,6 @@ async def api_probe(request: Request, font: str = "", engine: str = "",
             for eng in engines:
                 for stale in ("t.pdf", "t.log"):
                     (workdir / stale).unlink(missing_ok=True)
-                before = _child_peak_rss_kb()
                 cmd = [eng, "-interaction=nonstopmode", "-no-shell-escape", "t.tex"]
                 if cap > 0:
                     inner = " ".join(shlex.quote(part) for part in cmd)
@@ -830,20 +846,20 @@ async def api_probe(request: Request, font: str = "", engine: str = "",
                     code, stdio = "timeout", ""
                 except OSError as exc:
                     code, stdio = "not-runnable", str(exc)
-                after = _child_peak_rss_kb()
                 log = ((workdir / "t.log").read_text(encoding="utf-8", errors="replace")
                        if (workdir / "t.log").exists() else "")
                 pdf = workdir / "t.pdf"
                 out["engines"][eng] = {
                     "exit": code,
                     "pdf_bytes": pdf.stat().st_size if pdf.exists() else 0,
-                    # ru_maxrss is a high-water mark across all children, so the
-                    # delta attributes the growth to this run.
-                    "peak_child_rss_mb": round(max(after - before, 0) / 1024, 1),
-                    "cumulative_peak_rss_mb": round(after / 1024, 1),
-                    "finished_cleanly": "Here is how much of TeX's memory you used" in log,
-                    "font_cache_hit": "Loading font from cache" in log
-                                      or "font cache" in log.lower(),
+                    # ru_maxrss is a high-water mark over all children ever
+                    # reaped, so it cannot be attributed to one run - reporting a
+                    # before/after delta just gave 0.0. Compare this figure with
+                    # the instance's memory limit; that is the number that
+                    # decides whether a font/plan combination is viable.
+                    "peak_child_rss_mb_since_start": round(_child_peak_rss_kb() / 1024, 1),
+                    "finished_cleanly": _log_finished(log),
+                    "font_cache_hit": "Loading font from cache" in log,
                     "errors": [ln for ln in log.splitlines()
                                if ln.startswith("!")][:6],
                     "log_head": _head(log, 12),
