@@ -197,7 +197,7 @@ ENV CJK_FONT=${CJK_FONT}
 # $CJK_FONT rather than a hardcoded family - warming a font the service does not
 # use is wasted work.
 #
-# lualatex is tried first because it is the service's primary engine.
+# xelatex is tried first because it is the service's primary engine (PDF_ENGINE).
 RUN set -eu; \
     tmp="$(mktemp -d)"; cd "$tmp"; \
     printf '%s\n' '# 繁體中文測試 Traditional Chinese' '' '測試內文 123.' > t.md; \
@@ -209,7 +209,7 @@ RUN set -eu; \
         fi; \
         echo "CJK smoke test ($mode):"; \
         ok=""; \
-        for engine in lualatex xelatex; do \
+        for engine in xelatex lualatex; do \
             rm -f t.pdf t.log; \
             if "$engine" -interaction=nonstopmode t.tex > out.log 2>&1 && [ -f t.pdf ]; then \
                 if grep -q "Missing character" t.log 2>/dev/null; then \

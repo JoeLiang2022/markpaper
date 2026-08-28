@@ -240,8 +240,8 @@ docker run --rm -p 8000:8000 markpaper-web
 | `SYNC_WAIT_TIMEOUT`  | `600`     | Max seconds `POST /api/pdf` waits before returning `504`       |
 | `ENABLE_MERMAID`     | `false`   | Mermaid rendering (needs headless Chromium — see below)        |
 | `MEM_LIMIT_MB`       | `1024`    | Address-space cap per LaTeX child (runaway guard); `0` disables |
-| `PDF_ENGINE`         | `lualatex`| Primary LaTeX engine                                           |
-| `FALLBACK_ENGINE`    | `xelatex` | Engine retried once if the primary produces no PDF; `""` = off |
+| `PDF_ENGINE`         | `xelatex` | Primary LaTeX engine (cheaper on memory than LuaTeX)           |
+| `FALLBACK_ENGINE`    | `lualatex`| Engine retried once if the primary produces no PDF; `""` = off |
 | `CJK_FONT`           | *(unset)* | Override the detected CJK font (see below); unset = detect     |
 
 **Chinese / CJK output.** Two things are required and both are easy to get wrong silently:

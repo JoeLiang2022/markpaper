@@ -13,7 +13,7 @@ Pipeline per request (mirrors build_pdf() in devops.sh):
     3. tools/replace-fonts.sh     (swap macOS font names for container fonts)
     4. pandoc ... --filter pandoc-crossref --citeproc --csl=...  -> paper.tex
     5. tools/fix-latex-csl.sh     (patch CSL/CJK preamble)
-    6. lualatex (twice)           -> paper.pdf  (xelatex as fallback)
+    6. xelatex (twice)            -> paper.pdf  (lualatex as fallback)
 
 Security note: this endpoint compiles arbitrary user-supplied Markdown/LaTeX.
 See SECURITY CONSIDERATIONS below and the README. Set API_TOKEN in production.
@@ -68,13 +68,19 @@ ENABLE_MERMAID = os.environ.get("ENABLE_MERMAID", "true").lower() not in ("0", "
 # Latin-only documents stayed under the limit, which is why this looked like a
 # CJK/font problem rather than a memory one.
 MEM_LIMIT_MB = int(os.environ.get("MEM_LIMIT_MB", "1024"))
-# Primary LaTeX engine, and the engine to retry with when the primary cannot
-# load fonts. Set FALLBACK_ENGINE empty to disable the retry.
-# LuaLaTeX is primary: this image's XeTeX font path is broken (unicode-math
-# calls the removed \l__fontspec_script_int, so every \setmainfont fails), and
-# attempting xelatex first only burned time and memory on a doomed run.
-PDF_ENGINE = os.environ.get("PDF_ENGINE", "lualatex")
-FALLBACK_ENGINE = os.environ.get("FALLBACK_ENGINE", "xelatex").strip()
+# Primary LaTeX engine, and the engine to retry with if the primary produces no
+# PDF. Set FALLBACK_ENGINE empty to disable the retry.
+#
+# XeLaTeX is primary because of memory: XeTeX loads fonts through FreeType in C,
+# whereas LuaTeX's luaotfload parses them in Lua, which measured ~364 MB peak RSS
+# for a *one-line* document - far too close to a 512 MB instance for a real paper.
+#
+# An earlier version of this file had it the other way round, on the theory that
+# this image's XeTeX font path was broken ("Cannot use \XeTeXOTfeaturetag with
+# nullfont"). That was wrong: the fault was specific to Noto Sans CJK's ~120 MB
+# pan-CJK .ttc collection. With an ordinary font XeTeX loads it without complaint.
+PDF_ENGINE = os.environ.get("PDF_ENGINE", "xelatex")
+FALLBACK_ENGINE = os.environ.get("FALLBACK_ENGINE", "lualatex").strip()
 # Override the CJK font that tools/detect-fonts.sh picks. detect-fonts.sh prefers
 # Noto Sans CJK, which is the best-looking option but is a ~120 MB pan-CJK
 # collection; luaotfload parses fonts in Lua, so on a small instance a lighter
@@ -395,12 +401,10 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
 
         # ---- 6. LaTeX (two passes each, for references/TOC) -------------- #
         #
-        # XeLaTeX is the primary engine, but this image's XeTeX font path is
-        # broken: pandoc's template loads unicode-math, whose call to the
-        # now-removed \l__fontspec_script_int makes every \setmainfont fail with
-        # "Cannot use \XeTeXOTfeaturetag with nullfont" until LaTeX gives up.
-        # \XeTeXOTfeaturetag is XeTeX-specific, so LuaLaTeX (which goes through
-        # luaotfload) is unaffected. Fall back to it rather than failing.
+        # XeLaTeX first, LuaLaTeX as a fallback: the two use unrelated font
+        # machinery (FreeType in C vs luaotfload in Lua), so a font one cannot
+        # handle often works in the other, and XeTeX is much the cheaper of the
+        # two in memory. See PDF_ENGINE above.
         pdf_path = workdir / "paper.pdf"
         log_file = workdir / "paper.log"
 
