@@ -66,9 +66,16 @@ RUN mkdir -p /opt/puppeteer-cache && \
 
 ENV PUPPETEER_CACHE_DIR=/opt/puppeteer-cache
 
-# Resolve the installed Chrome executable path and write Puppeteer config
+# Resolve the installed Chrome executable path and write Puppeteer config.
+#
+# The extra flags are about memory, not features. Chromium normally forks a
+# zygote plus renderer processes, so a per-process rlimit cannot bound its total
+# footprint and a 512 MB instance gets OOM-killed as a whole (the caller sees a
+# 502). --single-process/--no-zygote keep it to one process so the cap in
+# webapp/app.py actually applies; --disable-dev-shm-usage avoids the small
+# /dev/shm in containers.
 RUN CHROME_PATH=$(find /opt/puppeteer-cache -name "chrome-headless-shell" -type f | head -1) && \
-    echo "{\"executablePath\": \"${CHROME_PATH}\", \"args\": [\"--no-sandbox\", \"--disable-setuid-sandbox\"]}" > /etc/puppeteer-config.json && \
+    printf '%s' "{\"executablePath\": \"${CHROME_PATH}\", \"args\": [\"--no-sandbox\", \"--disable-setuid-sandbox\", \"--single-process\", \"--no-zygote\", \"--disable-dev-shm-usage\", \"--disable-gpu\"]}" > /etc/puppeteer-config.json && \
     chmod 644 /etc/puppeteer-config.json
 ENV PUPPETEER_CONFIG_FILE=/etc/puppeteer-config.json
 
@@ -148,48 +155,63 @@ RUN set -eu; \
     done; \
     fmtutil-sys --byfmt xelatex || fmtutil-sys --all || true
 
-# Shared, pre-warmed TeX cache.
-#
-# LuaLaTeX's luaotfload must parse the (large) Noto CJK font and cache the
-# result under TEXMFVAR. At request time the service runs with openout_any=p,
-# so it cannot write an absolute path - meaning without a pre-built cache every
-# request re-parses the font in memory. That was making builds slow and pushing
-# the 512 MB instance over its limit. Build the cache here, once, as root.
-ENV TEXMFVAR=/var/lib/markpaper-texmf
-RUN mkdir -p "$TEXMFVAR" && chmod 777 "$TEXMFVAR"
-
 # End-to-end CJK check, driven through pandoc so it exercises the real runtime
-# path, and doubling as the cache warm-up.
+# path, and doubling as a warm-up of luaotfload's font cache.
 #
-# A hand-written \usepackage{fontspec} file is NOT enough: pandoc's template
-# also loads unicode-math, and it was unicode-math that broke \setmainfont while
-# a plain fontspec document compiled fine - so the earlier version of this test
-# passed and the image still failed on real requests.
+# TWO things this test must reproduce, because getting either wrong has already
+# shipped a broken image that only failed on live requests:
+#
+# 1. Go through pandoc, not a hand-written .tex. A plain \usepackage{fontspec}
+#    document compiles fine; it is unicode-math (which pandoc's template also
+#    loads) that broke \setmainfont. A narrower test passed and the image still
+#    failed.
+# 2. Use the same environment variables the service sets (see _latex_env in
+#    webapp/app.py). openin_any/openout_any/shell_escape change which files the
+#    engine may touch, and LuaTeX applies openin_any to the Lua `io` library
+#    too - so luaotfload's own bootstrap can die under a setting this test would
+#    otherwise never exercise. Run the check unrestricted first (to build the
+#    cache as root) and then again restricted, and require both to pass.
 #
 # lualatex is tried first because it is the service's primary engine.
 RUN set -eu; \
     tmp="$(mktemp -d)"; cd "$tmp"; \
     printf '%s\n' '# 繁體中文測試 Traditional Chinese' '' '測試內文 123.' > t.md; \
     pandoc t.md --standalone -V mainfont='Noto Sans CJK TC' -o t.tex; \
-    ok=""; \
-    for engine in lualatex xelatex; do \
-        rm -f t.pdf t.log; \
-        if "$engine" -interaction=nonstopmode t.tex > out.log 2>&1 && [ -f t.pdf ]; then \
-            if grep -q "Missing character" t.log 2>/dev/null; then \
-                echo "$engine: produced a PDF but dropped glyphs"; \
-                grep "Missing character" t.log | head -3; \
-            else \
-                echo "$engine: OK ($(wc -c < t.pdf) bytes)"; ok="$engine"; break; \
-            fi; \
-        else \
-            echo "$engine: FAILED"; tail -25 out.log || true; \
+    for mode in unrestricted restricted; do \
+        if [ "$mode" = restricted ]; then \
+            export openin_any=r openout_any=p shell_escape=f; \
         fi; \
+        echo "CJK smoke test ($mode):"; \
+        ok=""; \
+        for engine in lualatex xelatex; do \
+            rm -f t.pdf t.log; \
+            if "$engine" -interaction=nonstopmode t.tex > out.log 2>&1 && [ -f t.pdf ]; then \
+                if grep -q "Missing character" t.log 2>/dev/null; then \
+                    echo "  $engine: produced a PDF but dropped glyphs"; \
+                    { grep "Missing character" t.log | head -3; } || true; \
+                else \
+                    echo "  $engine: OK ($(wc -c < t.pdf) bytes)"; ok="$engine"; break; \
+                fi; \
+            else \
+                echo "  $engine: FAILED"; tail -25 out.log || true; \
+            fi; \
+        done; \
+        [ -n "$ok" ] \
+            || { echo "ERROR: no LaTeX engine can typeset CJK via pandoc ($mode)"; exit 1; }; \
+        echo "  -> $mode OK using $ok"; \
     done; \
-    [ -n "$ok" ] || { echo "ERROR: no LaTeX engine can typeset CJK via pandoc"; exit 1; }; \
-    echo "CJK smoke test OK using $ok"; \
-    cd /; rm -rf "$tmp"; \
-    chmod -R 777 "$TEXMFVAR"; \
-    echo "TEXMFVAR cache size: $(du -sh "$TEXMFVAR" | cut -f1)"
+    cd /; rm -rf "$tmp"
+
+# Make luaotfload's font cache readable (and its directory writable) for the
+# non-build user, so requests reuse the cache warmed above instead of re-parsing
+# the large Noto CJK font on every single build.
+RUN set -eu; \
+    for var in TEXMFVAR TEXMFCACHE TEXMFSYSVAR; do \
+        d="$(kpsewhich -var-value="$var" 2>/dev/null || true)"; \
+        [ -n "$d" ] && [ -d "$d" ] || continue; \
+        chmod -R a+rwX "$d"; \
+        echo "$var=$d ($(du -sh "$d" | cut -f1))"; \
+    done
 
 # --- Web service layer ------------------------------------------------------ #
 

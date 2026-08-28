@@ -13,7 +13,7 @@ Pipeline per request (mirrors build_pdf() in devops.sh):
     3. tools/replace-fonts.sh     (swap macOS font names for container fonts)
     4. pandoc ... --filter pandoc-crossref --citeproc --csl=...  -> paper.tex
     5. tools/fix-latex-csl.sh     (patch CSL/CJK preamble)
-    6. xelatex (twice)            -> paper.pdf
+    6. lualatex (twice)           -> paper.pdf  (xelatex as fallback)
 
 Security note: this endpoint compiles arbitrary user-supplied Markdown/LaTeX.
 See SECURITY CONSIDERATIONS below and the README. Set API_TOKEN in production.
@@ -107,11 +107,16 @@ def _run_capped(cmd: list[str], cwd: Path, env: dict, timeout: int) -> subproces
     """
     Run a memory-hungry child under an address-space limit.
 
-    Without this, a runaway xelatex (or Chromium) pushes the container past its
-    memory limit and the platform kills/restarts the *whole service* - which
-    users experience as an HTTP 502 and a lost job. Capping the child means it
-    is the child that dies, so the request fails with a real error message and
-    the server keeps serving. Set MEM_LIMIT_MB=0 to disable.
+    Without this, a runaway LaTeX run pushes the container past its memory limit
+    and the platform kills/restarts the *whole service* - which users experience
+    as an HTTP 502 and a lost job. Capping the child means it is the child that
+    dies, so the request fails with a real error message and the server keeps
+    serving. Set MEM_LIMIT_MB=0 to disable.
+
+    Caveat: rlimits are per process, so this only contains single-process
+    children. It does NOT bound headless Chromium, which forks a zygote and
+    renderers - that is why Dockerfile.web passes --single-process/--no-zygote
+    and why ENABLE_MERMAID defaults to off on small instances.
     """
     if MEM_LIMIT_MB > 0 and os.name == "posix":
         inner = " ".join(shlex.quote(part) for part in cmd)
@@ -165,6 +170,42 @@ def _scan_log(log: str) -> list[str]:
     return warnings
 
 
+# Environment variables that must never reach a LaTeX child process. Because
+# openin_any cannot be set to "paranoid" (see _latex_env), a hostile document
+# can \input an absolute path such as /proc/self/environ; scrubbing secrets from
+# the child's environment makes that read worthless instead of a credential leak.
+_SECRET_ENV_RE = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_KEY|_KEY$",
+                            re.IGNORECASE)
+
+
+def _latex_env() -> dict:
+    """
+    Build the environment for pandoc/LaTeX children: hardened, but workable.
+
+    openout_any=p confines writes to the working directory (this is also TeX
+    Live's own default) and shell_escape=f blocks \\write18.
+
+    openin_any is deliberately NOT "p". Paranoid mode rejects reads of absolute
+    paths, and LuaTeX applies that policy to the Lua `io` library as well - so
+    luaotfload's own bootstrap dies:
+
+        luaotfload | load : Failed to load "luaotfload" module "multiscript"
+        luaotfload-multiscript.lua:70: attempt to index a nil value (local 'f')
+
+    because line 70 is `io.open(kpse.find_file"ScriptExtensions.txt")` and
+    kpse.find_file returns an absolute path under /opt/texlive. Every build
+    therefore failed at font-loading time while the image itself was fine, which
+    is why the build-time smoke test passed and real requests did not. "r"
+    (restricted, no dotfiles) is the strongest setting the toolchain tolerates;
+    _SECRET_ENV_RE compensates for the weaker file policy.
+    """
+    env = {k: v for k, v in os.environ.items() if not _SECRET_ENV_RE.search(k)}
+    env["openin_any"] = "r"
+    env["openout_any"] = "p"
+    env["shell_escape"] = "f"
+    return env
+
+
 def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str]]:
     """
     Compile `markdown` into a PDF using the MarkPaper pipeline.
@@ -199,44 +240,52 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
             shutil.copy2(DEFAULT_BIB, workdir / "references.bib")
 
         # ---- Environment ------------------------------------------------- #
-        env = os.environ.copy()
-        # Harden xelatex: restrict file reads/writes to the working tree and
-        # forbid shell-escape (\write18). Reduces the blast radius of hostile
-        # LaTeX injected via a YAML header-includes block.
-        env["openin_any"] = "p"    # paranoid: no absolute/parent-dir reads
-        env["openout_any"] = "p"
-        env["shell_escape"] = "f"
-        # Deliberately do NOT point TEXMFVAR at the per-request directory.
-        # LuaLaTeX's luaotfload has to parse the (very large) CJK font and cache
-        # the result under TEXMFVAR. With a fresh directory per request - and
-        # openout_any=p refusing absolute-path writes anyway - that cache could
-        # never persist, so every single build re-parsed the font in memory.
-        # That is what made builds slow and pushed the instance over its memory
-        # limit. The image pre-warms a shared cache at build time and TEXMFVAR
-        # points there, so requests only read it. It holds font caches only, no
-        # document data, so sharing it does not weaken per-request isolation.
+        env = _latex_env()
+
+        # ---- 0. Non-fatal problems to report back to the caller ---------- #
+        warnings: list[str] = []
 
         # ---- 1. Mermaid diagrams ---------------------------------------- #
         # Only invoke the Mermaid step when the document actually contains a
-        # mermaid block. mmdc launches headless Chromium, which alone can
-        # exhaust a 512 MB instance and take the whole process down (OOM kill
-        # surfaces as a 502), so never pay that cost speculatively.
+        # mermaid block. mmdc launches headless Chromium, which is by far the
+        # heaviest thing in this pipeline: it forks a zygote plus renderer
+        # processes, so the per-process address-space cap in _run_capped does
+        # NOT bound its total footprint. On a 512 MB instance that reliably
+        # exhausts memory, and the platform kills the whole container - which
+        # callers see as an HTTP 502 with their job silently gone.
+        #
+        # Hence ENABLE_MERMAID defaults to off for deployments (see render.yaml).
+        # Skipping is safe - pandoc renders the block as a listing - but it must
+        # not be silent, or the user just gets a PDF with a diagram missing.
         has_mermaid = "```mermaid" in markdown
-        src_for_fonts = "paper.md"
+        src_for_fonts = "paper.mermaid.tmp.md"
         if ENABLE_MERMAID and has_mermaid:
             r = _run_capped(
                 ["bash", "tools/process-mermaid.sh", "paper.md", "paper.mermaid.tmp.md", "images"],
                 workdir, env, BUILD_TIMEOUT,
             )
-            if (workdir / "paper.mermaid.tmp.md").exists():
-                src_for_fonts = "paper.mermaid.tmp.md"
-            else:
-                # Mermaid step failed to produce output; continue with raw markdown.
+            if not (workdir / "paper.mermaid.tmp.md").exists():
+                # Mermaid step produced nothing at all; continue with raw markdown.
                 shutil.copy2(workdir / "paper.md", workdir / "paper.mermaid.tmp.md")
-                src_for_fonts = "paper.mermaid.tmp.md"
+            # process-mermaid.sh keeps the original code block when a single
+            # diagram fails to render, so a written output file does not mean
+            # every diagram made it. Check what actually came out.
+            if "```mermaid" in (workdir / "paper.mermaid.tmp.md").read_text(
+                    encoding="utf-8", errors="replace"):
+                warnings.append(
+                    "At least one Mermaid diagram could not be rendered; its "
+                    "source is shown as a code block instead. "
+                    + (_tail(r.stderr or r.stdout, 5) or "")
+                )
         else:
             shutil.copy2(workdir / "paper.md", workdir / "paper.mermaid.tmp.md")
-            src_for_fonts = "paper.mermaid.tmp.md"
+            if has_mermaid:
+                warnings.append(
+                    "Mermaid rendering is disabled on this instance "
+                    "(ENABLE_MERMAID=false), so diagrams appear as code blocks. "
+                    "It is off by default because headless Chromium exhausts a "
+                    "512 MB instance; enable it on a larger plan."
+                )
 
         # ---- 2. Detect an available CJK font ---------------------------- #
         cjk_font = "AR PL UMing TW"
@@ -320,16 +369,22 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
 
         engine_used = PDF_ENGINE
         ok, log_text, r = run_engine(engine_used)
+        first_attempt = None
 
         # Any failure is worth one attempt with the other engine: the two use
         # completely different font machinery (luaotfload vs XeTeX), so a fault
         # in one often does not exist in the other.
         if not ok and FALLBACK_ENGINE and FALLBACK_ENGINE != PDF_ENGINE:
+            # Keep the primary engine's log: when both fail, reporting only the
+            # fallback's error hides the actual first cause.
+            first_attempt = f"--- {engine_used} ---\n{_tail(log_text, 30)}"
             engine_used = FALLBACK_ENGINE
             ok, log_text, r = run_engine(engine_used)
 
         if not ok:
             detail = _tail(log_text, 50) or _tail(r.stdout or r.stderr if r else "")
+            if first_attempt:
+                detail = f"{first_attempt}\n\n--- {engine_used} ---\n{detail}"
             # A child killed by the address-space cap (or the kernel) leaves no
             # useful LaTeX error, so say so rather than showing an empty log.
             killed = r is not None and r.returncode is not None and r.returncode < 0
@@ -346,7 +401,7 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         # nonstopmode means LaTeX happily emits a PDF even after real errors
         # (missing glyphs, for instance, vanish silently), so inspect the log
         # and report anything that corrupts the output.
-        warnings = _scan_log(log_text)
+        warnings += _scan_log(log_text)
         if engine_used != PDF_ENGINE:
             warnings.insert(0, f"Built with {engine_used} because {PDF_ENGINE} "
                                "could not load fonts in this image.")
@@ -557,9 +612,23 @@ async def _extract_input(
     if content is None:
         ctype = request.headers.get("content-type", "")
         if "application/json" in ctype:
-            payload = await request.json()
+            try:
+                payload = await request.json()
+            except Exception:                              # noqa: BLE001
+                raise HTTPException(status_code=400, detail="Body is not valid JSON.")
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=400,
+                                    detail="JSON body must be an object.")
             content = payload.get("markdown")
             bib = bib or payload.get("bib")
+            # Guard the types: a non-string here used to reach len()/encode()
+            # and surface as an opaque 500 instead of a usable 400.
+            if content is not None and not isinstance(content, str):
+                raise HTTPException(status_code=400,
+                                    detail="'markdown' must be a string.")
+            if bib is not None and not isinstance(bib, str):
+                raise HTTPException(status_code=400,
+                                    detail="'bib' must be a string.")
         else:
             body = (await request.body()).decode("utf-8", errors="replace")
             content = body or None

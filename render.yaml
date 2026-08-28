@@ -12,10 +12,11 @@ services:
     healthCheckPath: /healthz
 
     # LaTeX (full TeX Live) + headless Chromium (Mermaid) are memory hungry.
-    # "free" (512 MB, $0) is fine for plain Markdown; Chromium only starts when a
-    # document actually contains Mermaid diagrams, which can OOM on 512 MB. If you
-    # hit out-of-memory errors, either set ENABLE_MERMAID=false or upgrade the plan
-    # (e.g. "starter" or "standard"). Free instances also sleep after ~15 min idle.
+    # "free" (512 MB, $0) is fine for plain Markdown, but headless Chromium is
+    # not: it forks renderer processes, so no per-process limit can contain it and
+    # the platform OOM-kills the whole container - which callers see as a 502 with
+    # their job gone. Mermaid is therefore off by default here; see ENABLE_MERMAID
+    # below. Free instances also sleep after ~15 min idle.
     plan: free
 
     envVars:
@@ -28,9 +29,13 @@ services:
       # Simultaneous builds. Keep at 1 on small instances to avoid OOM.
       - key: MAX_CONCURRENCY
         value: "1"
-      # Set to "false" to disable Mermaid rendering and save memory/time.
+      # Mermaid rendering launches headless Chromium, which reliably exhausts a
+      # 512 MB instance and takes the whole service down (502). Off by default so
+      # the service stays up; documents containing Mermaid still build, with the
+      # diagram shown as a code block and a warning attached to the result.
+      # Set to "true" on a plan with more memory (starter or larger).
       - key: ENABLE_MERMAID
-        value: "true"
+        value: "false"
       # SECURITY: this endpoint compiles arbitrary user Markdown/LaTeX.
       # By default the service is PUBLIC so the browser UI works out of the box.
       # To lock it down, add an environment variable named API_TOKEN in the

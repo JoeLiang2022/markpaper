@@ -235,19 +235,22 @@ docker run --rm -p 8000:8000 markpaper-web
 | `MAX_INPUT_BYTES`    | `2097152` | Max accepted Markdown payload (2 MiB)                          |
 | `MAX_CONCURRENCY`    | `1`       | Simultaneous builds / worker count (budget ~1 GB each)         |
 | `MAX_QUEUE`          | `50`      | Max jobs waiting before new submissions get `429`              |
-| `JOB_TTL`            | `900`     | Seconds a finished result is retained                          |
-| `MAX_STORED_RESULTS` | `20`      | Max finished PDFs kept in memory (oldest evicted first)        |
+| `JOB_TTL`            | `300`     | Seconds a finished result is retained                          |
+| `MAX_STORED_RESULTS` | `5`       | Max finished PDFs kept in memory (oldest evicted first)        |
 | `SYNC_WAIT_TIMEOUT`  | `600`     | Max seconds `POST /api/pdf` waits before returning `504`       |
-| `ENABLE_MERMAID`     | `true`    | Set `false` to disable Mermaid rendering (saves memory/time)   |
+| `ENABLE_MERMAID`     | `false`   | Mermaid rendering (needs headless Chromium — see below)        |
+| `MEM_LIMIT_MB`       | `380`     | Address-space cap per LaTeX child; `0` disables                |
+| `PDF_ENGINE`         | `lualatex`| Primary LaTeX engine                                           |
+| `FALLBACK_ENGINE`    | `xelatex` | Engine retried once if the primary produces no PDF; `""` = off |
 
 **Chinese / CJK output.** Two things are required and both are easy to get wrong silently:
 
 1. **A CJK font** — the image installs `fonts-noto-cjk`.
 2. **`xeCJK.sty`** — the base image ships a *reduced* TeX Live scheme, so `xecjk` is installed explicitly.
 
-Neither failure is loud. XeLaTeX runs with `-interaction=nonstopmode`, so if `xeCJK` or the font is missing it still emits a valid-looking PDF with **every Chinese character silently dropped**. Both Dockerfiles therefore assert these exist at build time, and the service scans the LaTeX log and reports dropped glyphs as warnings on the result instead of handing you a quietly wrong PDF. Use `GET /api/diag` to confirm what a running instance actually has.
+Neither failure is loud. The LaTeX engine runs with `-interaction=nonstopmode`, so if `xeCJK` or the font is missing it still emits a valid-looking PDF with **every Chinese character silently dropped**. Both Dockerfiles therefore assert these exist at build time, and the service scans the LaTeX log and reports dropped glyphs as warnings on the result instead of handing you a quietly wrong PDF. Use `GET /api/diag` to confirm what a running instance actually has.
 
-Given those, the service auto-configures CJK: if your Markdown does not declare a CJK font itself, it injects `\usepackage{xeCJK}` plus the detected font (normally *Noto Sans CJK TC*) into the preamble, so plain Chinese Markdown with no YAML at all renders correctly. If you *do* want control, declare it yourself and the service leaves your choice alone:
+Given those, the service auto-configures CJK: if your Markdown does not declare a font itself, it passes pandoc `-V mainfont=<detected CJK font>` (normally *Noto Sans CJK TC*, which also covers Latin), so plain Chinese Markdown with no YAML at all renders correctly. If you *do* want control, declare it yourself and the service leaves your choice alone:
 
 ```yaml
 ---
@@ -255,9 +258,9 @@ CJKmainfont: Noto Sans CJK TC
 ---
 ```
 
-> **Security note**: This service compiles arbitrary user-supplied Markdown/LaTeX. XeLaTeX is run without shell-escape and with restricted file access (`openin_any=p`/`openout_any=p`), each build runs in an isolated temporary directory, and size/time/concurrency limits apply. Even so, treat a public instance as untrusted compute: **set `API_TOKEN`** for anything beyond a throwaway demo. The service is stateless and has no built-in authentication otherwise.
+> **Security note**: This service compiles arbitrary user-supplied Markdown/LaTeX. LaTeX is run without shell-escape and with writes confined to the working directory (`openout_any=p`), each build runs in an isolated temporary directory, and size/time/concurrency limits apply. Reads use `openin_any=r` rather than `p`, because paranoid mode also blocks LuaTeX's own font machinery from reading `ScriptExtensions.txt` under `/opt/texlive` and no build can then succeed; to compensate, secret-looking environment variables (anything matching `TOKEN`/`SECRET`/`PASSWORD`/`KEY`) are stripped from the LaTeX child's environment, so `\input{/proc/self/environ}` yields nothing useful. Even so, treat a public instance as untrusted compute: **set `API_TOKEN`** for anything beyond a throwaway demo. The service is stateless and has no built-in authentication otherwise.
 
-> **Resource note**: `render.yaml` defaults to the **free** plan (512 MB, $0), which is fine for plain Markdown. Headless Chromium only starts when a document actually contains Mermaid diagrams, and that can exhaust 512 MB — if you hit out-of-memory errors on a Mermaid-heavy document, either set `ENABLE_MERMAID=false` or upgrade the plan (`starter`/`standard`). Free instances also sleep after ~15 minutes of inactivity and cold-start slowly because the image is large.
+> **Resource note**: `render.yaml` defaults to the **free** plan (512 MB, $0), which is fine for plain Markdown. Mermaid rendering is a different story: `mmdc` launches headless Chromium, which forks renderer processes, so no per-process memory limit can contain it and 512 MB gets exhausted — the platform then kills the whole container and callers see a **502** with their job gone. `ENABLE_MERMAID` therefore defaults to `false`. Documents containing Mermaid still build; the diagram source appears as a code block and a warning is attached to the result. Set `ENABLE_MERMAID=true` once you are on `starter` or larger. Free instances also sleep after ~15 minutes of inactivity and cold-start slowly because the image is large.
 
 ### Conceptual Overview of the Workflow
 

@@ -58,7 +58,11 @@ RUN mkdir -p /opt/puppeteer-cache && \
 # Set environment variables for Puppeteer
 ENV PUPPETEER_CACHE_DIR=/opt/puppeteer-cache
 
-# Resolve the installed Chrome executable path and write Puppeteer config
+# Resolve the installed Chrome executable path and write Puppeteer config.
+# Deliberately different from Dockerfile.web, which adds --single-process and
+# friends: that image runs on a 512 MB instance where a multi-process Chromium
+# gets the container OOM-killed. Local CLI builds have room, so keep the default
+# (faster, more robust) process model here.
 RUN CHROME_PATH=$(find /opt/puppeteer-cache -name "chrome-headless-shell" -type f | head -1) && \
     echo "{\"executablePath\": \"${CHROME_PATH}\", \"args\": [\"--no-sandbox\", \"--disable-setuid-sandbox\"]}" > /etc/puppeteer-config.json && \
     chmod 644 /etc/puppeteer-config.json
@@ -143,6 +147,10 @@ RUN set -eu; \
 # template also loads unicode-math, and it was unicode-math that broke
 # \setmainfont while a plain fontspec document compiled fine - so the earlier
 # version of this test passed and the image still failed on real requests.
+#
+# Dockerfile.web runs this twice, the second time with the web service's
+# openin_any/openout_any settings. devops.sh imposes no such restrictions, so a
+# single unrestricted pass is the right check for this image.
 RUN set -eu; \
     tmp="$(mktemp -d)"; cd "$tmp"; \
     printf '%s\n' '# 繁體中文測試 Traditional Chinese' '' '測試內文 123.' > t.md; \
