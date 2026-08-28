@@ -29,6 +29,13 @@ services:
       # Simultaneous builds. Keep at 1 on small instances to avoid OOM.
       - key: MAX_CONCURRENCY
         value: "1"
+      # Address-space cap per LaTeX child (MiB), as a runaway guard only. Do NOT
+      # size this to the instance: `ulimit -v` bounds virtual address space, and
+      # LuaTeX reserves far more of that than it uses. A value tight enough to
+      # "fit" 512 MB kills every CJK build, because luaotfload has to parse the
+      # ~20 MB Noto CJK collection. 0 disables the cap.
+      - key: MEM_LIMIT_MB
+        value: "1024"
       # Mermaid rendering launches headless Chromium, which reliably exhausts a
       # 512 MB instance and takes the whole service down (502). Off by default so
       # the service stays up; documents containing Mermaid still build, with the

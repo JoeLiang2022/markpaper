@@ -58,9 +58,16 @@ BUILD_TIMEOUT = int(os.environ.get("BUILD_TIMEOUT", "240"))          # seconds p
 MAX_INPUT_BYTES = int(os.environ.get("MAX_INPUT_BYTES", str(2 * 1024 * 1024)))  # 2 MiB
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "1"))         # simultaneous builds
 ENABLE_MERMAID = os.environ.get("ENABLE_MERMAID", "true").lower() not in ("0", "false", "no")
-# Address-space cap for xelatex/mmdc, in MiB. Sized to leave room for the web
-# process inside a 512 MB instance. 0 disables the cap.
-MEM_LIMIT_MB = int(os.environ.get("MEM_LIMIT_MB", "380"))
+# Address-space cap for LaTeX children, in MiB. 0 disables it.
+#
+# This is a runaway guard, NOT a memory budget - see _run_capped. It was 380,
+# chosen to "fit" a 512 MB instance, and that silently broke every CJK build:
+# luaotfload parses the ~20 MB Noto CJK collection into Lua tables and needs far
+# more address space than that, so lualatex was killed mid-run while the exact
+# same document compiled fine during the image build (which has no cap).
+# Latin-only documents stayed under the limit, which is why this looked like a
+# CJK/font problem rather than a memory one.
+MEM_LIMIT_MB = int(os.environ.get("MEM_LIMIT_MB", "1024"))
 # Primary LaTeX engine, and the engine to retry with when the primary cannot
 # load fonts. Set FALLBACK_ENGINE empty to disable the retry.
 # LuaLaTeX is primary: this image's XeTeX font path is broken (unicode-math
@@ -105,18 +112,20 @@ def _run(cmd: list[str], cwd: Path, env: dict, timeout: int) -> subprocess.Compl
 
 def _run_capped(cmd: list[str], cwd: Path, env: dict, timeout: int) -> subprocess.CompletedProcess:
     """
-    Run a memory-hungry child under an address-space limit.
+    Run a child under an address-space limit, so a runaway process dies instead
+    of the container (a container OOM kill reaches the caller as an HTTP 502 with
+    the job lost). Set MEM_LIMIT_MB=0 to disable.
 
-    Without this, a runaway LaTeX run pushes the container past its memory limit
-    and the platform kills/restarts the *whole service* - which users experience
-    as an HTTP 502 and a lost job. Capping the child means it is the child that
-    dies, so the request fails with a real error message and the server keeps
-    serving. Set MEM_LIMIT_MB=0 to disable.
+    Two things this is NOT:
 
-    Caveat: rlimits are per process, so this only contains single-process
-    children. It does NOT bound headless Chromium, which forks a zygote and
-    renderers - that is why Dockerfile.web passes --single-process/--no-zygote
-    and why ENABLE_MERMAID defaults to off on small instances.
+    - It is not a way to fit LaTeX into a small instance. `ulimit -v` bounds
+      virtual address space, which LuaTeX reserves far more of than it actually
+      uses, so a limit tight enough to "budget" 512 MB kills legitimate builds.
+      Keep it generous and treat BUILD_TIMEOUT and MAX_CONCURRENCY as the real
+      controls.
+    - It is not protection against multi-process children. rlimits are per
+      process, so headless Chromium (zygote + renderers) escapes it entirely -
+      hence --single-process in Dockerfile.web and ENABLE_MERMAID off by default.
     """
     if MEM_LIMIT_MB > 0 and os.name == "posix":
         inner = " ".join(shlex.quote(part) for part in cmd)
@@ -159,12 +168,13 @@ def _scan_log(log: str) -> list[str]:
     if "Package xeCJK Error" in log:
         warnings.append("xeCJK reported an error; CJK text may be missing.")
 
-    if "XeTeXOTfeaturetag with nullfont" in log or "l__fontspec_script_int" in log:
+    # Match the actual error, not the mere mention of a fontspec internal:
+    # fontspec writes \l__fontspec_script_int into perfectly healthy LuaTeX logs,
+    # so testing for that name alone flagged successful builds.
+    if "Cannot use \\XeTeXOTfeaturetag" in log:
         warnings.append(
-            "xeCJK is incompatible with the installed fontspec in this image "
-            "(it uses the removed \\l__fontspec_script_int). Remove "
-            "CJKmainfont/xeCJK from the document and let the service set a CJK "
-            "mainfont instead."
+            "XeTeX could not load the requested font (it ended up as nullfont), "
+            "so text may be missing or set in a substitute face."
         )
 
     return warnings
@@ -367,6 +377,20 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
                     if log_file.exists() else "")
             return pdf_path.exists(), text, result
 
+        def describe_failure(engine: str, log: str,
+                             result: Optional[subprocess.CompletedProcess]) -> str:
+            """Label one engine's attempt, flagging a process that was killed."""
+            code = result.returncode if result is not None else "?"
+            head = f"--- {engine} (exit {code}) ---"
+            # A LaTeX run that merely errors still writes its usage summary. If
+            # that is absent the process died mid-run, which the log alone makes
+            # look like an unrelated font problem.
+            if "Here is how much of TeX's memory you used" not in log:
+                head += (f"\n{engine} died before finishing (no LaTeX summary in "
+                         f"the log). Usually the {MEM_LIMIT_MB} MiB address-space "
+                         f"cap, or the container running out of memory.")
+            return f"{head}\n{_tail(log, 30)}"
+
         engine_used = PDF_ENGINE
         ok, log_text, r = run_engine(engine_used)
         first_attempt = None
@@ -377,25 +401,16 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         if not ok and FALLBACK_ENGINE and FALLBACK_ENGINE != PDF_ENGINE:
             # Keep the primary engine's log: when both fail, reporting only the
             # fallback's error hides the actual first cause.
-            first_attempt = f"--- {engine_used} ---\n{_tail(log_text, 30)}"
+            first_attempt = describe_failure(engine_used, log_text, r)
             engine_used = FALLBACK_ENGINE
             ok, log_text, r = run_engine(engine_used)
 
         if not ok:
-            detail = _tail(log_text, 50) or _tail(r.stdout or r.stderr if r else "")
+            detail = describe_failure(engine_used, log_text, r)
+            if not log_text.strip():
+                detail += "\n" + _tail((r.stdout or r.stderr) if r else "")
             if first_attempt:
-                detail = f"{first_attempt}\n\n--- {engine_used} ---\n{detail}"
-            # A child killed by the address-space cap (or the kernel) leaves no
-            # useful LaTeX error, so say so rather than showing an empty log.
-            killed = r is not None and r.returncode is not None and r.returncode < 0
-            if killed or not detail.strip():
-                detail = (
-                    (detail + "\n\n" if detail.strip() else "")
-                    + f"{engine_used} exited abnormally (code "
-                      f"{r.returncode if r else '?'}). This is usually the "
-                      f"{MEM_LIMIT_MB} MiB memory cap being hit. Try a smaller "
-                      "document, or raise MEM_LIMIT_MB on a larger instance."
-                )
+                detail = f"{first_attempt}\n\n{detail}"
             raise BuildError(f"{engine_used} failed to produce a PDF.", detail)
 
         # nonstopmode means LaTeX happily emits a PDF even after real errors
