@@ -16,11 +16,18 @@ FROM dalibo/pandocker:latest-full
 
 # Install jq and curl for translation scripts, plus the basic dependencies
 # Puppeteer/Chrome needs (required by mermaid-cli).
+#
+# Several CJK fonts are installed on purpose, not by accident. fonts-noto-cjk is
+# the nice one but ships a ~120 MB pan-CJK collection, and LuaTeX's luaotfload
+# parses fonts in Lua - which does not fit a 512 MB instance. The arphic and
+# wqy-zenhei packages are far smaller alternatives, so CJK_FONT can be pointed at
+# one when memory is tight. Compare them with GET /api/probe?font=...
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
         jq curl gnupg ca-certificates \
         fonts-liberation fonts-noto-color-emoji \
         fonts-noto-cjk \
+        fonts-arphic-uming fonts-arphic-ukai fonts-wqy-zenhei \
         libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
         libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
         libgbm1 libpangocairo-1.0-0 libcairo-gobject2 \

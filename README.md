@@ -242,6 +242,7 @@ docker run --rm -p 8000:8000 markpaper-web
 | `MEM_LIMIT_MB`       | `1024`    | Address-space cap per LaTeX child (runaway guard); `0` disables |
 | `PDF_ENGINE`         | `lualatex`| Primary LaTeX engine                                           |
 | `FALLBACK_ENGINE`    | `xelatex` | Engine retried once if the primary produces no PDF; `""` = off |
+| `CJK_FONT`           | *(unset)* | Override the detected CJK font (see below); unset = detect     |
 
 **Chinese / CJK output.** Two things are required and both are easy to get wrong silently:
 
@@ -250,7 +251,9 @@ docker run --rm -p 8000:8000 markpaper-web
 
 Neither failure is loud. The LaTeX engine runs with `-interaction=nonstopmode`, so if `xeCJK` or the font is missing it still emits a valid-looking PDF with **every Chinese character silently dropped**. Both Dockerfiles therefore assert these exist at build time, and the service scans the LaTeX log and reports dropped glyphs as warnings on the result instead of handing you a quietly wrong PDF. Use `GET /api/diag` to confirm what a running instance actually has.
 
-Given those, the service auto-configures CJK: if your Markdown does not declare a font itself, it passes pandoc `-V mainfont=<detected CJK font>` (normally *Noto Sans CJK TC*, which also covers Latin), so plain Chinese Markdown with no YAML at all renders correctly. If you *do* want control, declare it yourself and the service leaves your choice alone:
+There is a third, less obvious requirement: **the font has to fit in memory**. LuaTeX's `luaotfload` parses fonts in Lua, and `fonts-noto-cjk` ships a ~120 MB pan-CJK collection, which a 512 MB instance cannot afford — the build gets killed even though nothing is missing. The image therefore also installs the much smaller `fonts-arphic-*` and `fonts-wqy-zenhei` families, and `CJK_FONT` lets you select one (e.g. `CJK_FONT=AR PL UMing TW`). Use `GET /api/probe?font=<family>` to compare candidates on a running instance: it compiles a one-line document with each engine and reports exit code, PDF size and **peak child RSS**, which is the number that actually decides whether a plan is big enough. It also accepts `engine=`, `mem_limit=` and `text=`.
+
+Given those, the service auto-configures CJK: if your Markdown does not declare a font itself, it passes pandoc `-V mainfont=<CJK font>` (`CJK_FONT` if set, otherwise the detected one — normally *Noto Sans CJK TC*, which also covers Latin), so plain Chinese Markdown with no YAML at all renders correctly. If you *do* want control, declare it yourself and the service leaves your choice alone:
 
 ```yaml
 ---

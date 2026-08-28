@@ -75,6 +75,13 @@ MEM_LIMIT_MB = int(os.environ.get("MEM_LIMIT_MB", "1024"))
 # attempting xelatex first only burned time and memory on a doomed run.
 PDF_ENGINE = os.environ.get("PDF_ENGINE", "lualatex")
 FALLBACK_ENGINE = os.environ.get("FALLBACK_ENGINE", "xelatex").strip()
+# Override the CJK font that tools/detect-fonts.sh picks. detect-fonts.sh prefers
+# Noto Sans CJK, which is the best-looking option but is a ~120 MB pan-CJK
+# collection; luaotfload parses fonts in Lua, so on a small instance a lighter
+# family (e.g. "AR PL UMing TW", "WenQuanYi Zen Hei") is the difference between
+# building and being OOM-killed. Set empty to use whatever is detected.
+# Compare candidates with GET /api/probe?font=...
+CJK_FONT = os.environ.get("CJK_FONT", "").strip()
 API_TOKEN = os.environ.get("API_TOKEN", "").strip()                  # optional bearer token
 
 # Job queue knobs
@@ -137,6 +144,19 @@ def _run_capped(cmd: list[str], cwd: Path, env: dict, timeout: int) -> subproces
 
 def _tail(text: str, lines: int = 40) -> str:
     return "\n".join((text or "").splitlines()[-lines:])
+
+
+def _head(text: str, lines: int = 40) -> str:
+    return "\n".join((text or "").splitlines()[:lines])
+
+
+def _child_peak_rss_kb() -> int:
+    """Peak RSS across all reaped children, in KiB. 0 where unavailable."""
+    try:
+        import resource                                  # POSIX only
+        return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    except Exception:                                    # noqa: BLE001
+        return 0
 
 
 def _scan_log(log: str) -> list[str]:
@@ -298,9 +318,12 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
                 )
 
         # ---- 2. Detect an available CJK font ---------------------------- #
-        cjk_font = "AR PL UMing TW"
+        # CJK_FONT wins when set: detect-fonts.sh is shared with the CLI
+        # workflow and rightly prefers Noto, but the web service may be running
+        # somewhere that cannot afford it.
+        cjk_font = CJK_FONT or "AR PL UMing TW"
         r = _run(["bash", "tools/detect-fonts.sh"], workdir, env, 60)
-        for line in (r.stdout or "").splitlines():
+        for line in ([] if CJK_FONT else (r.stdout or "").splitlines()):
             if line.startswith("CJK_FONT_TC="):
                 value = line.split("=", 1)[1].strip()
                 if value:
@@ -735,6 +758,101 @@ async def api_diag(request: Request) -> JSONResponse:
             out["cjk_families"] = f"unavailable: {exc}"
 
         return out
+
+    return JSONResponse(await asyncio.to_thread(probe))
+
+
+@app.get("/api/probe")
+async def api_probe(request: Request, font: str = "", engine: str = "",
+                    mem_limit: int = -1, text: str = "測試中文 Test 123.") -> JSONResponse:
+    """
+    Compile a one-line document and report what each engine actually costs.
+
+    This exists because CJK failures on a small instance are a *memory* story,
+    and memory was the one thing nothing reported. The pipeline would fail with a
+    LaTeX log full of font messages whether the real cause was a missing font, a
+    file-access policy, or a child being killed - three very different fixes.
+
+    Query parameters make it a sweep tool, so alternatives can be compared
+    without rebuilding the image:
+        font       font family to set as mainfont (default: detected CJK font)
+        engine     single engine to try (default: PDF_ENGINE then FALLBACK_ENGINE)
+        mem_limit  address-space cap in MiB for this probe only; 0 = uncapped
+        text       document body
+
+    Reported per engine: exit code, whether a PDF appeared and its size, peak
+    child RSS, whether luaotfload loaded a cached font or parsed it afresh, and
+    the first error lines from the log.
+    """
+    _check_auth(request)
+
+    def probe() -> dict:
+        cap = MEM_LIMIT_MB if mem_limit < 0 else mem_limit
+        engines = [engine] if engine else [
+            e for e in (PDF_ENGINE, FALLBACK_ENGINE) if e]
+
+        workdir = Path(tempfile.mkdtemp(prefix="markpaper-probe-"))
+        try:
+            env = _latex_env()
+            chosen = font or CJK_FONT
+            if not chosen:
+                r = _run(["bash", str(TOOLS_DIR / "detect-fonts.sh")],
+                         APP_ROOT, env, 60)
+                for line in (r.stdout or "").splitlines():
+                    if line.startswith("CJK_FONT_TC="):
+                        chosen = line.split("=", 1)[1].strip()
+
+            (workdir / "t.md").write_text(f"# Probe\n\n{text}\n", encoding="utf-8")
+            cmd = ["pandoc", "t.md", "--standalone"]
+            if chosen:
+                cmd += ["-V", f"mainfont={chosen}"]
+            cmd += ["-o", "t.tex"]
+            p = _run(cmd, workdir, env, 60)
+            if not (workdir / "t.tex").exists():
+                return {"error": "pandoc failed", "log": _tail(p.stderr or p.stdout),
+                        "font": chosen}
+
+            out: dict = {"font": chosen, "mem_limit_mb": cap, "engines": {}}
+            for eng in engines:
+                for stale in ("t.pdf", "t.log"):
+                    (workdir / stale).unlink(missing_ok=True)
+                before = _child_peak_rss_kb()
+                cmd = [eng, "-interaction=nonstopmode", "-no-shell-escape", "t.tex"]
+                if cap > 0:
+                    inner = " ".join(shlex.quote(part) for part in cmd)
+                    cmd = ["bash", "-c",
+                           f"ulimit -v {cap * 1024} 2>/dev/null || true; exec {inner}"]
+                try:
+                    p = _run(cmd, workdir, env, BUILD_TIMEOUT)
+                    code: object = p.returncode
+                    stdio = _tail(p.stdout or p.stderr, 10)
+                except subprocess.TimeoutExpired:
+                    code, stdio = "timeout", ""
+                except OSError as exc:
+                    code, stdio = "not-runnable", str(exc)
+                after = _child_peak_rss_kb()
+                log = ((workdir / "t.log").read_text(encoding="utf-8", errors="replace")
+                       if (workdir / "t.log").exists() else "")
+                pdf = workdir / "t.pdf"
+                out["engines"][eng] = {
+                    "exit": code,
+                    "pdf_bytes": pdf.stat().st_size if pdf.exists() else 0,
+                    # ru_maxrss is a high-water mark across all children, so the
+                    # delta attributes the growth to this run.
+                    "peak_child_rss_mb": round(max(after - before, 0) / 1024, 1),
+                    "cumulative_peak_rss_mb": round(after / 1024, 1),
+                    "finished_cleanly": "Here is how much of TeX's memory you used" in log,
+                    "font_cache_hit": "Loading font from cache" in log
+                                      or "font cache" in log.lower(),
+                    "errors": [ln for ln in log.splitlines()
+                               if ln.startswith("!")][:6],
+                    "log_head": _head(log, 12),
+                    "log_tail": _tail(log, 12),
+                    "stdio_tail": stdio,
+                }
+            return out
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
     return JSONResponse(await asyncio.to_thread(probe))
 
