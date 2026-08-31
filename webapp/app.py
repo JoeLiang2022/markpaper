@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -102,6 +104,28 @@ SYNC_WAIT_TIMEOUT = int(os.environ.get("SYNC_WAIT_TIMEOUT", "600"))   # /api/pdf
 # --------------------------------------------------------------------------- #
 # Build pipeline
 # --------------------------------------------------------------------------- #
+
+# Stage-by-stage logging to stdout.
+#
+# This is the only diagnosis that survives the build taking the container down.
+# When the platform OOM-kills (or otherwise restarts) the instance, the job and
+# its error message are in memory and vanish with it - the caller just sees a 502
+# and "Unknown or expired job", which says nothing about the cause. The host's
+# log stream outlives the process, so the last line logged identifies the stage
+# that died, and peak RSS shows whether memory was the reason.
+# Upper-case deliberately: several helpers here take a parameter called `log`
+# (a LaTeX log), which would otherwise shadow the logger.
+#
+# Configure this logger only, rather than logging.basicConfig(): touching the
+# root logger raises the verbosity of every third-party library too.
+LOG = logging.getLogger("markpaper")
+if not LOG.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOG.addHandler(_handler)
+    LOG.setLevel(logging.INFO)
+    LOG.propagate = False
+
 
 class BuildError(RuntimeError):
     """Raised when the PDF build fails; carries a log tail for diagnostics."""
@@ -288,6 +312,16 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         raise BuildError("Empty Markdown input.")
 
     workdir = Path(tempfile.mkdtemp(prefix=f"markpaper-{uuid.uuid4().hex[:8]}-"))
+    tag = workdir.name
+    started = time.monotonic()
+
+    def stage(name: str, **facts: object) -> None:
+        """Log progress to stdout so it outlives a container restart."""
+        detail = " ".join(f"{k}={v}" for k, v in facts.items())
+        LOG.info("[%s] %+6.1fs %s%s", tag, time.monotonic() - started, name,
+                 f" {detail}" if detail else "")
+
+    stage("start", bytes=len(markdown.encode("utf-8")))
     try:
         # ---- Stage the working directory --------------------------------- #
         (workdir / "paper.md").write_text(markdown, encoding="utf-8")
@@ -328,6 +362,7 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         # not be silent, or the user just gets a PDF with a diagram missing.
         has_mermaid = "```mermaid" in markdown
         src_for_fonts = "paper.mermaid.tmp.md"
+        stage("mermaid", present=has_mermaid, enabled=ENABLE_MERMAID)
         if ENABLE_MERMAID and has_mermaid:
             r = _run_capped(
                 ["bash", "tools/process-mermaid.sh", "paper.md", "paper.mermaid.tmp.md", "images"],
@@ -408,8 +443,10 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
             pandoc_cmd += ["-V", f"mainfont={cjk_font}"]
         pandoc_cmd += ["-o", "paper.tex"]
 
+        stage("pandoc", font=cjk_font, injected_mainfont=not declares_fonts)
         r = _run(pandoc_cmd, workdir, env, BUILD_TIMEOUT)
         if r.returncode != 0 or not (workdir / "paper.tex").exists():
+            stage("pandoc-failed", exit=r.returncode)
             raise BuildError("Pandoc conversion failed.", _tail(r.stderr or r.stdout))
 
         # ---- 5. Patch CSL / CJK preamble -------------------------------- #
@@ -418,6 +455,8 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         # Read the final LaTeX once, to decide which engines can run it at all.
         engine_source = (workdir / "paper.tex").read_text(encoding="utf-8",
                                                           errors="replace")
+        stage("latex-ready", tex_bytes=len(engine_source),
+              xecjk="xeCJK" in engine_source)
 
         # ---- 6. LaTeX (two passes each, for references/TOC) -------------- #
         #
@@ -432,11 +471,18 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
             for stale in (pdf_path, log_file):
                 stale.unlink(missing_ok=True)
             result = None
-            for _ in range(2):
+            for pass_no in (1, 2):
+                # Log before each pass, not after: if the pass is what kills the
+                # container, the "after" line never gets written.
+                stage(f"{engine}-pass{pass_no}", peak_child_rss_mb=round(
+                    _child_peak_rss_kb() / 1024, 1))
                 result = _run_capped(
                     [engine, "-interaction=nonstopmode", "-no-shell-escape", "paper.tex"],
                     workdir, env, BUILD_TIMEOUT,
                 )
+                stage(f"{engine}-pass{pass_no}-done", exit=result.returncode,
+                      pdf=pdf_path.exists(),
+                      peak_child_rss_mb=round(_child_peak_rss_kb() / 1024, 1))
             text = (log_file.read_text(encoding="utf-8", errors="replace")
                     if log_file.exists() else "")
             return pdf_path.exists(), text, result
@@ -488,7 +534,12 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
                 detail += "\n" + _tail((r.stdout or r.stderr) if r else "")
             if first_attempt:
                 detail = f"{first_attempt}\n\n{detail}"
+            # Also to stdout: the job carrying this message may not survive.
+            LOG.error("[%s] build failed with %s\n%s", tag, engine_used, detail)
             raise BuildError(f"{engine_used} failed to produce a PDF.", detail)
+
+        stage("done", engine=engine_used, pdf_bytes=pdf_path.stat().st_size,
+              warnings=len(warnings))
 
         # nonstopmode means LaTeX happily emits a PDF even after real errors
         # (missing glyphs, for instance, vanish silently), so inspect the log
