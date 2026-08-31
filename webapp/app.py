@@ -231,6 +231,22 @@ _SECRET_ENV_RE = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_KEY|_K
                             re.IGNORECASE)
 
 
+# Packages that only work under one engine. Running the other engine on such a
+# document cannot succeed, and trying anyway is actively harmful: a doomed
+# LuaTeX run still parses fonts and can push a small instance into an OOM kill,
+# losing the primary engine's error message along with the whole job.
+_ENGINE_ONLY_PACKAGES = {
+    "lualatex": ("xeCJK", "xltxtra", "xunicode"),        # XeTeX-only
+    "xelatex": ("luacode", "luatexbase", "luacolor"),    # LuaTeX-only
+}
+
+
+def _engine_blockers(latex_source: str, engine: str) -> list[str]:
+    """Packages in `latex_source` that make `engine` unusable for it."""
+    return [pkg for pkg in _ENGINE_ONLY_PACKAGES.get(engine, ())
+            if pkg in latex_source]
+
+
 def _latex_env() -> dict:
     """
     Build the environment for pandoc/LaTeX children: hardened, but workable.
@@ -399,6 +415,10 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         # ---- 5. Patch CSL / CJK preamble -------------------------------- #
         _run(["bash", "tools/fix-latex-csl.sh", "paper.tex"], workdir, env, 60)
 
+        # Read the final LaTeX once, to decide which engines can run it at all.
+        engine_source = (workdir / "paper.tex").read_text(encoding="utf-8",
+                                                          errors="replace")
+
         # ---- 6. LaTeX (two passes each, for references/TOC) -------------- #
         #
         # XeLaTeX first, LuaLaTeX as a fallback: the two use unrelated font
@@ -439,10 +459,23 @@ def build_pdf(markdown: str, bib: Optional[str] = None) -> tuple[bytes, list[str
         ok, log_text, r = run_engine(engine_used)
         first_attempt = None
 
-        # Any failure is worth one attempt with the other engine: the two use
+        # Only retry with the other engine if it *could* work. Some packages are
+        # engine-specific, and running the wrong engine on them is not merely
+        # futile - a doomed LuaTeX run still parses fonts and can exhaust the
+        # container, so the caller gets a 502 with their job gone instead of the
+        # primary engine's perfectly good error message. paper.md hits exactly
+        # this: it loads xeCJK from header-includes, which requires XeTeX.
+        blocked = _engine_blockers(engine_source, FALLBACK_ENGINE)
+        if not ok and blocked:
+            warnings.append(
+                f"Not retrying with {FALLBACK_ENGINE}: the document uses "
+                f"{', '.join(blocked)}, which {FALLBACK_ENGINE} does not support."
+            )
+
+        # Any other failure is worth one attempt with the other engine: they use
         # completely different font machinery (luaotfload vs XeTeX), so a fault
         # in one often does not exist in the other.
-        if not ok and FALLBACK_ENGINE and FALLBACK_ENGINE != PDF_ENGINE:
+        if not ok and not blocked and FALLBACK_ENGINE and FALLBACK_ENGINE != PDF_ENGINE:
             # Keep the primary engine's log: when both fail, reporting only the
             # fallback's error hides the actual first cause.
             first_attempt = describe_failure(engine_used, log_text, r)
